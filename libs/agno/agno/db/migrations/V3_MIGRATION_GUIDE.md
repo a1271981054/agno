@@ -256,6 +256,224 @@ asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="evals"
 SQLite reverts need SQLite 3.35+ for `ALTER TABLE ... DROP COLUMN`; on older builds
 the revert logs and skips, matching `v2.5.6`'s behaviour.
 
+## Metrics: per-user buckets
+
+Metrics get the same `user_id` column, and one thing none of the other tables need:
+**its unique key changes**.
+
+```
+agno_metrics
+├── id                  TEXT PRIMARY KEY
+├── date                DATE (indexed)
+├── aggregation_period  TEXT             -- "daily"
+├── user_id             TEXT NOT NULL    -- new in v3.0; "" = unowned
+├── ...                                  -- run / session counts, token and model metrics
+└── UNIQUE (user_id, date, aggregation_period)   -- was UNIQUE (date, aggregation_period)
+```
+
+v3.0 stores one metrics row per user per day instead of one row per day, so `user_id`
+has to be part of the key. Until it is, an existing table is not just missing a column —
+it is **broken in two ways**, and neither of them is loud:
+
+1. **The column is missing**, so `is_valid_table` rejects the table. What the caller
+   sees depends on the backend. On SQLite and Postgres `GET /metrics` answers HTTP 500
+   with `Table agno_metrics has an invalid schema`. On MySQL the adapter logs the same
+   error and returns nothing, so the route answers HTTP 200 with
+   `{"metrics": [], "updated_at": null}`. On SingleStore the check never fires at all —
+   SQLAlchemy cannot reflect the table (its JSON columns come back as a type it does not
+   recognise), and an inspection failure is treated as "valid" — so the caller gets the
+   driver's `(1054, "Unknown column 'user_id' in 'field list'")` instead.
+
+2. **The key is still the legacy one**, even once the column has been added by hand.
+   Postgres and SQLite name `(user_id, date, aggregation_period)` as the upsert's
+   conflict target and there is no such key, so every recalculation fails: an explicit
+   refresh returns HTTP 500, while `GET /metrics` keeps answering 200 with whatever was
+   already stored and only logs the failure. MySQL is quieter still —
+   `ON DUPLICATE KEY UPDATE` matches whichever unique key it finds, so the write succeeds
+   against the legacy one and the second owner's numbers land on the first owner's row.
+   One row survives for the day, under the first owner's name, and nothing errors.
+
+Either way, what an operator notices is that metrics stop moving, not that something
+failed. On the SQL adapters — the only ones with a schema to fix, see below — the
+migration does both halves:
+
+```python
+asyncio.run(MigrationManager(db).up(table_type="metrics"))
+```
+
+If `up()` already ran on this deployment before the metrics migration existed, the
+metrics table may carry a `3.0.0` stamp from that run (older builds stamped tables the
+migration never touched) and the call above will skip it. Pass `force=True` once —
+the migration's own existence checks make the re-run safe:
+
+```python
+asyncio.run(MigrationManager(db).up(table_type="metrics", force=True))
+```
+
+Unlike the other isolated tables, existing metrics rows are stamped with `""`, not
+`NULL` — SQL treats every `NULL` as distinct, which would silently break a unique key
+containing the column. `""` is the "unowned" bucket: it is what pre-isolation history
+is, and the adapter maps it back to `None` on the way out, so API consumers never see it.
+The rows are not split retroactively per user — a metrics row does not record which
+sessions fed it.
+
+**The boundary day is cleared.** As the column lands, the migration deletes one row:
+the *unowned* `completed = false` row with the newest date, and only when that date
+sits past every completed day. Such a row holds the whole day's traffic for *every*
+user; stamped unowned it would become a bucket the per-user recalculation never
+rewrites, and the day would be counted once per user and once again in that leftover
+row for good. Nothing is lost — the recalculation is certain to revisit that day and
+rebuilds it from its sessions on the next refresh. The one exception is a deployment
+that prunes that day's sessions *before* migrating: the recalculation then has nothing
+to compute from, produces no record, and the day stays gone. Migrate first, prune
+after. Every other unfinished row stays,
+owned or not: a deeper unfinished day may have had its sessions pruned since, and its
+metric row is then the only record of that day, so a stale-but-present row beats a
+deleted one. And the delete is restricted to unowned rows (the `""` sentinel or a
+hand-patched `NULL`) and only runs when the column or the key actually changed, so a
+re-run against an already-migrated table cannot remove per-user buckets. Completed
+days are frozen and are left exactly as they are.
+
+**SQLite rebuilds the table.** SQLite writes a unique constraint into the `CREATE TABLE`
+statement and has no `ALTER TABLE ... DROP CONSTRAINT`, so the migration renames the
+table aside, creates the v3.0 shape from the adapter's own schema, copies the rows in
+and drops the old one. The whole rebuild is one transaction: if it is interrupted the
+original table is left exactly as it was, with nothing renamed aside and nothing to
+clean up. Columns and indexes you added yourself are carried across.
+
+**SingleStore keeps no unique constraint.** A columnstore table may carry only one
+`UNIQUE` index once any of them spans multiple columns, and the `id` primary key already
+is one, so declaring the triple fails with error 1706 — which also means SingleStore
+never had the legacy key and there is nothing to swap. It gets the column and its index
+and nothing else. Uniqueness on the triple lives in `bulk_upsert_metrics` instead, as a
+select-then-write that is not atomic, so two refreshes running at once can write the
+same bucket twice.
+
+**Which adapters need work.** As with eval runs, schema-level work is only needed on the
+seven SQL adapters (`PostgresDb`, `AsyncPostgresDb`, `SqliteDb`, `AsyncSqliteDb`,
+`MySQLDb`, `AsyncMySQLDb`, `SingleStoreDb`) — they get the column, the key swap and the
+revert refusal. The other nine (`MongoDb`, `FirestoreDb`, `DynamoDb`, `SurrealDb`,
+`RedisDb`, `ValkeyDb`, `JsonDb`, `GcsJsonDb`, `InMemoryDb`) store a metrics record as a
+document and pick `user_id` up without a schema change — and they cannot run this
+migration at all: none of them keeps a per-table schema version, so `MigrationManager`
+logs `No version found for table agno_metrics` and moves on before dispatching. That is
+not specific to metrics; the sessions migration behaves the same way on those backends.
+
+What repairs them instead is the recalculation. `calculate_metrics` is authoritative for
+every `(date, aggregation_period)` pair it writes records for: around the write it clears
+any *other* owner's record for those pairs. So the single pre-v3.0 record for the day of
+the upgrade is removed on the first refresh afterwards rather than being summed on top of
+the new per-user records for good, and an upgraded deployment converges on its own.
+Completed days from before the upgrade fall outside the recalculation window and stay as
+one unowned bucket per day — which is exactly what the SQL migration leaves behind too.
+MongoDB needed one thing more: its pre-v3.0 `date_1_aggregation_period_1` unique index
+would reject every per-user document after the first for a date, so the collection's
+index setup now drops it.
+
+One more thing worth an operator's time. On Postgres and MySQL the migrated `user_id`
+carries a server `DEFAULT ''`, because `ADD COLUMN ... NOT NULL` needs one on a populated
+table; SQLite's is rebuilt straight from the schema and has none. So an `INSERT` that
+omits `user_id` lands in the unowned bucket on Postgres and MySQL and fails with
+`NOT NULL constraint failed` on SQLite.
+
+### Reverting metrics
+
+Reverting drops the column and puts the legacy key back — but **only while every row is
+still unowned**. Once metrics have been collected per user, dropping `user_id` would
+merge two owners' buckets for a date into duplicate rows that the legacy key cannot even
+accept, so the revert refuses and logs instead:
+
+```
+Skipping revert of agno_metrics: it holds per-user metric rows, and dropping user_id
+would merge them into duplicates for the same date. Consolidate or delete the owned
+rows first.
+```
+
+Deleting the owned rows throws the per-user history away. To consolidate instead — one
+row per date and period, carrying the summed numbers — run this first. It is written for
+Postgres; the other SQL backends need the same shape with their own JSON functions.
+
+```sql
+BEGIN;
+
+CREATE TEMP TABLE agno_metrics_merged AS
+WITH tokens AS (
+    SELECT date, aggregation_period, jsonb_object_agg(key, total) AS token_metrics
+    FROM (
+        SELECT m.date, m.aggregation_period, t.key, sum((t.value #>> '{}')::bigint) AS total
+        FROM agno_metrics m, jsonb_each(m.token_metrics) t
+        GROUP BY 1, 2, 3
+    ) s
+    GROUP BY 1, 2
+), models AS (
+    SELECT date, aggregation_period, jsonb_agg(jsonb_build_object(
+               'model_id', model_id, 'model_provider', model_provider, 'count', total)) AS model_metrics
+    FROM (
+        SELECT m.date, m.aggregation_period,
+               e ->> 'model_id' AS model_id, e ->> 'model_provider' AS model_provider,
+               sum((e ->> 'count')::bigint) AS total
+        FROM agno_metrics m, jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(m.model_metrics) = 'array' THEN m.model_metrics ELSE '[]'::jsonb END) e
+        GROUP BY 1, 2, 3, 4
+    ) s
+    GROUP BY 1, 2
+)
+SELECT min(m.id) AS id, m.date, m.aggregation_period,
+       sum(m.agent_runs_count)        AS agent_runs_count,
+       sum(m.team_runs_count)         AS team_runs_count,
+       sum(m.workflow_runs_count)     AS workflow_runs_count,
+       sum(m.agent_sessions_count)    AS agent_sessions_count,
+       sum(m.team_sessions_count)     AS team_sessions_count,
+       sum(m.workflow_sessions_count) AS workflow_sessions_count,
+       -- one owned bucket is one user; a pre-v3.0 row already counted the day's users
+       greatest(count(*) FILTER (WHERE m.user_id IS DISTINCT FROM ''),
+                max(m.users_count) FILTER (WHERE m.user_id = '')) AS users_count,
+       coalesce(t.token_metrics, '{}'::jsonb) AS token_metrics,
+       coalesce(md.model_metrics, '[]'::jsonb) AS model_metrics,
+       min(m.created_at) AS created_at,
+       max(m.updated_at) AS updated_at,
+       bool_and(m.completed) AS completed
+FROM agno_metrics m
+LEFT JOIN tokens t ON t.date = m.date AND t.aggregation_period = m.aggregation_period
+LEFT JOIN models md ON md.date = m.date AND md.aggregation_period = m.aggregation_period
+GROUP BY m.date, m.aggregation_period, t.token_metrics, md.model_metrics;
+
+DELETE FROM agno_metrics WHERE id NOT IN (SELECT id FROM agno_metrics_merged);
+
+UPDATE agno_metrics m SET
+    user_id = '',
+    agent_runs_count        = g.agent_runs_count,
+    team_runs_count         = g.team_runs_count,
+    workflow_runs_count     = g.workflow_runs_count,
+    agent_sessions_count    = g.agent_sessions_count,
+    team_sessions_count     = g.team_sessions_count,
+    workflow_sessions_count = g.workflow_sessions_count,
+    users_count             = g.users_count,
+    token_metrics           = g.token_metrics,
+    model_metrics           = g.model_metrics,
+    created_at              = g.created_at,
+    updated_at              = g.updated_at,
+    completed               = g.completed
+FROM agno_metrics_merged g WHERE m.id = g.id;
+
+DROP TABLE agno_metrics_merged;
+
+COMMIT;
+```
+
+Qualify `agno_metrics` with your schema, or set `search_path`, if it is not on the
+default one. The counts are summed, `token_metrics` is merged key by key, and
+`model_metrics` — a JSON *array* of `{model_id, model_provider, count}` — is unnested,
+grouped and re-aggregated so no model is listed twice. `users_count` becomes the number
+of owned buckets for the day, which is what a v2.5.6 row meant by it; a row already
+carrying a larger count is a pre-v3.0 one and keeps its own. Take a backup first: the
+per-user breakdown is gone afterwards, and so is the `user_id` column once the revert
+runs.
+
+```python
+asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="metrics"))
+```
+
 ## Breaking changes
 
 1. **Direct SQL against `agno_sessions.runs`** stops being a complete view of session

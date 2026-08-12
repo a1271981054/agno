@@ -118,6 +118,34 @@ def get_metrics_calculation_starting_date(
         raise ValueError(f"Unexpected type for created_at: {type(first_session_date)}")
 
 
+def _delete_superseded_metrics(
+    client: Union[BlockingWsSurrealConnection, BlockingHttpSurrealConnection],
+    table: str,
+    metrics_records: List[Dict[str, Any]],
+) -> None:
+    """Delete the metrics records the given recalculation supersedes.
+
+    An owner still holding a (date, aggregation_period) pair this recalculation
+    wrote has no sessions left on that date, and its stale record would be summed
+    on top of the fresh ones, the pre-user_id bare-date record included.
+
+    Args:
+        table (str): The metrics table.
+        metrics_records (List[Dict[str, Any]]): The freshly calculated, surrealized records.
+    """
+    owners_per_pair: Dict[tuple, set] = {}
+    for metric in metrics_records:
+        owners_per_pair.setdefault((metric["date"], metric["aggregation_period"]), set()).add(metric.get("user_id", ""))
+
+    for (date_to_process, aggregation_period), owners in owners_per_pair.items():
+        utils.query(
+            client,
+            f"DELETE {table} WHERE date = $date AND aggregation_period = $period AND user_id NOT IN $owners",
+            {"date": date_to_process, "period": aggregation_period, "owners": sorted(owners, key=str)},
+            dict,
+        )
+
+
 def bulk_upsert_metrics(
     client: Union[BlockingWsSurrealConnection, BlockingHttpSurrealConnection],
     table: str,
@@ -137,26 +165,36 @@ def bulk_upsert_metrics(
 
     metrics_records = [surrealize_dates(x) for x in metrics_records]
 
-    try:
-        results = []
-        from agno.utils.log import log_debug
+    results = []
+    from agno.utils.log import log_debug
 
-        for metric in metrics_records:
-            log_debug(f"Upserting metric: {metric}")  # Add this
+    for metric in metrics_records:
+        log_debug(f"Upserting metric: {metric}")
+        # Per-record: a mid-run failure must not report the records that
+        # already landed as unwritten, nor skip the sweep below.
+        try:
             result = utils.query_one(
                 client,
                 "UPSERT $record CONTENT $content",
                 {"record": RecordID(table, metric["id"]), "content": metric},
                 dict,
             )
-            if result:
-                results.append(result)
-        return results
+        except Exception as e:
+            log_error(f"Error upserting metrics record: {str(e)}")
+            continue
 
+        if result:
+            results.append(result)
+
+    # Clear what this recalculation supersedes. SurrealDB gives no transaction here,
+    # so this runs after the fresh set is in place: a crash leaves a stale record
+    # over the day's total, never a date with no metrics.
+    try:
+        _delete_superseded_metrics(client, table, metrics_records)
     except Exception as e:
-        log_error(f"Error upserting metrics: {str(e)}")
+        log_error(f"Error clearing superseded metrics: {str(e)}")
 
-    return []
+    return results
 
 
 def fetch_all_sessions_data(

@@ -35,6 +35,7 @@ from agno.db.utils import (
     deserialize_session,
     deserialize_sessions,
     filter_context_runs,
+    is_superseded_metrics_record,
     merge_runs_table_with_legacy_blob,
     metric_record_day,
 )
@@ -1482,17 +1483,17 @@ class RedisDb(BaseDb):
                 return None
 
             results = []
+            existing_metrics = self._get_all_records("metrics")
+
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
-                if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
-                    continue
+                # One record per user_id. An empty date yields none — the sweep below clears its buckets.
+                date_records = calculate_date_metrics(date_to_process, sessions_for_date)
 
-                # One record per distinct user_id, plus the empty-string bucket for unowned sessions
-                for metrics_record in calculate_date_metrics(date_to_process, sessions_for_date):
-                    # Update the existing record while preserving created_at
+                for metrics_record in date_records:
+                    # Preserve created_at across re-runs.
                     existing_record = self._get_record("metrics", metrics_record["id"])
                     if existing_record:
                         metrics_record["created_at"] = existing_record.get("created_at", metrics_record["created_at"])
@@ -1500,6 +1501,19 @@ class RedisDb(BaseDb):
                     success = self._store_record("metrics", metrics_record["id"], metrics_record)
                     if success:
                         results.append(metrics_record)
+
+                # ``existing_metrics`` predates the writes above, so skip the keys just written.
+                owners = {record["user_id"] for record in date_records}
+                written_ids = {record["id"] for record in date_records}
+                for stale_record in existing_metrics:
+                    # ``.get``: a hand-written record can lack an id.
+                    stale_id = stale_record.get("id")
+                    if (
+                        stale_id
+                        and stale_id not in written_ids
+                        and is_superseded_metrics_record(stale_record, date_to_process, owners)
+                    ):
+                        self._delete_record("metrics", stale_id)
 
             log_debug("Updated metrics calculations")
 

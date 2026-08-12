@@ -13,13 +13,38 @@ migration — it stays in place as a backup. New writes will null it as sessions
 are touched. When you have verified the migration and taken a backup, drop the
 column manually by calling ``db.cleanup_legacy_runs_column()``.
 
-Existing rows keep a NULL user_id, so they stay visible to admins and to unscoped
-deployments. Document backends pick the field up without a schema change.
+Per-user isolation changes:
+- Add the user_id column and its index to every table in ``USER_ID_TABLE_TYPES``
+- Move the metrics unique key onto (user_id, date, aggregation_period)
+
+The column backs per-user isolation: get / list / rename / delete scope by
+user_id when the caller is scoped, and stay global when it is None. Existing
+rows keep a NULL user_id, so they stay visible to admins and to unscoped
+deployments while a scoped caller sees none of them. Document backends store
+these records as documents and pick the field up without a schema change.
+
+metrics is the exception on both counts. Its user_id is NOT NULL with an
+empty-string sentinel for "unowned", because SQL treats every NULL as distinct
+and a unique key holding the column would never match, so existing rows are
+stamped with "" rather than NULL. And its unique key itself changes: the pre-v3.0
+key on (date, aggregation_period) rejects the second user's row for a date and
+leaves the per-user upsert with no conflict target to match, so a metrics table
+that only gains the column is still broken. SQLite writes its unique constraint
+into the CREATE TABLE statement and cannot drop one, so there the table is
+rebuilt.
+
+To isolate another table, declare user_id on that table in the adapter schemas
+that have it, register the table type in ``MigrationManager`` and add it to
+``USER_ID_TABLE_TYPES`` — the per-backend functions read the column type from
+the schema, so they need no change. A backend whose schema does not declare the
+column is skipped, so a table type that only some adapters support is safe to
+list here.
 """
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from agno.db.base import AsyncBaseDb, BaseDb
 from agno.db.migrations.utils import quote_db_identifier
@@ -35,9 +60,27 @@ except ImportError:
 BATCH_SIZE = 50
 
 
-# Table types that get a user_id column and index. Extend this tuple to isolate another
-# table: a backend whose schema does not declare the column is skipped.
-USER_ID_TABLE_TYPES = ("evals", "components", "knowledge", "schedules", "schedule_runs")
+# Table types that get a user_id column and index, so AgentOS can scope them per user.
+# Adding a type here is not enough on its own: it must also appear in both copies of
+# ``_table_type_to_attr`` in migrations/manager.py, or ``up()`` is never called for it.
+# The per-backend functions need no change, and backends whose schema does not declare
+# the column skip it.
+# - knowledge: declared on Postgres, SQLite, MySQL and SingleStore
+# - schedules / schedule_runs: declared on Postgres and SQLite (the only adapters
+#   with schedule schemas)
+# - metrics: declared on all four, and the only one that also needs its unique key
+#   swapped. See METRICS_LEGACY_UNIQUE_NAME below.
+USER_ID_TABLE_TYPES = ("evals", "components", "knowledge", "schedules", "schedule_runs", "metrics")
+
+# The pre-v3.0 metrics unique key, on (date, aggregation_period). A per-user
+# bucket needs user_id in the key, so the legacy key has to go or the second
+# user's row for a date is rejected. Only the legacy name and columns are
+# hard-coded: that is history, not schema.
+METRICS_LEGACY_UNIQUE_NAME = "uq_metrics_date_period"
+METRICS_LEGACY_UNIQUE_COLUMNS = ("date", "aggregation_period")
+
+# MySQL and SingleStore reject an identifier longer than this with error 1059.
+MAX_MYSQL_IDENTIFIER_LENGTH = 64
 
 
 def up(db: BaseDb, table_type: str, table_name: str) -> bool:
@@ -45,6 +88,7 @@ def up(db: BaseDb, table_type: str, table_name: str) -> bool:
     Apply the following changes to the database:
     - Move session runs out of the sessions `runs` column into the runs table
     - Add a user_id column and index to the tables listed in USER_ID_TABLE_TYPES
+    - Move the metrics unique key onto (user_id, date, aggregation_period)
 
     Notice only the changes related to the given table_type are applied.
 
@@ -91,6 +135,7 @@ async def async_up(db: AsyncBaseDb, table_type: str, table_name: str) -> bool:
     Apply the following changes to the database:
     - Move session runs out of the sessions `runs` column into the runs table
     - Add a user_id column and index to the tables listed in USER_ID_TABLE_TYPES
+    - Move the metrics unique key onto (user_id, date, aggregation_period)
 
     Notice only the changes related to the given table_type are applied.
 
@@ -121,6 +166,7 @@ def down(db: BaseDb, table_type: str, table_name: str) -> bool:
     Revert the following changes to the database:
     - Move runs back into the sessions `runs` column and drop the runs table
     - Drop the user_id column and index from the tables listed in USER_ID_TABLE_TYPES
+    - Move the metrics unique key back onto (date, aggregation_period)
 
     Notice only the changes related to the given table_type are reverted.
 
@@ -167,6 +213,7 @@ async def async_down(db: AsyncBaseDb, table_type: str, table_name: str) -> bool:
     Revert the following changes to the database:
     - Move runs back into the sessions `runs` column and drop the runs table
     - Drop the user_id column and index from the tables listed in USER_ID_TABLE_TYPES
+    - Move the metrics unique key back onto (date, aggregation_period)
 
     Notice only the changes related to the given table_type are reverted.
 
@@ -219,6 +266,12 @@ def _migrate_sqlite(db: BaseDb, table_type: str, table_name: str) -> bool:
     """Apply the v3.0.0 changes for the given table type on SQLite."""
     if table_type == "sessions":
         return _migrate_sqlite_sessions(db, table_name)
+    if table_type == "metrics":
+        # metrics moves its unique key onto user_id, which SQLite can only do by
+        # rebuilding the table, and the rebuild brings the column and its index
+        # with it, so there is nothing left for the plain add to do. Routing it
+        # here also means a table that is not shaped like metrics gets neither.
+        return _migrate_sqlite_metrics_table(db, table_type, table_name)
     if table_type in USER_ID_TABLE_TYPES:
         return _migrate_sqlite_user_id(db, table_type, table_name)
     return False
@@ -228,6 +281,9 @@ async def _migrate_async_sqlite(db: AsyncBaseDb, table_type: str, table_name: st
     """Apply the v3.0.0 changes for the given table type on async SQLite."""
     if table_type == "sessions":
         return await _migrate_async_sqlite_sessions(db, table_name)
+    if table_type == "metrics":
+        # See _migrate_sqlite: on SQLite the rebuild is the whole metrics migration
+        return await _migrate_async_sqlite_metrics_table(db, table_type, table_name)
     if table_type in USER_ID_TABLE_TYPES:
         return await _migrate_async_sqlite_user_id(db, table_type, table_name)
     return False
@@ -273,6 +329,10 @@ def _revert_sqlite(db: BaseDb, table_type: str, table_name: str) -> bool:
     """Revert the v3.0.0 changes for the given table type on SQLite."""
     if table_type == "sessions":
         return _revert_sqlite_sessions(db, table_name)
+    if table_type == "metrics":
+        # SQLite cannot drop a column its unique constraint covers, so metrics
+        # goes back the same way it came: by rebuilding the table.
+        return _revert_sqlite_metrics_table(db, table_type, table_name)
     if table_type in USER_ID_TABLE_TYPES:
         return _revert_sqlite_user_id(db, table_type, table_name)
     return False
@@ -282,6 +342,9 @@ async def _revert_async_sqlite(db: AsyncBaseDb, table_type: str, table_name: str
     """Revert the v3.0.0 changes for the given table type on async SQLite."""
     if table_type == "sessions":
         return await _revert_async_sqlite_sessions(db, table_name)
+    if table_type == "metrics":
+        # See _revert_sqlite: metrics goes back through a rebuild
+        return await _revert_async_sqlite_metrics_table(db, table_type, table_name)
     if table_type in USER_ID_TABLE_TYPES:
         return await _revert_async_sqlite_user_id(db, table_type, table_name)
     return False
@@ -354,20 +417,31 @@ def _build_run_rows(
     return rows
 
 
-def _forget_runs_table(db) -> None:
-    """Drop the runs table from the adapter's SQLAlchemy state after a revert.
+def _forget_table(db, table_name: Optional[str], attribute: str) -> None:
+    """Drop a table from the adapter's SQLAlchemy state after it goes away.
 
-    ``DROP TABLE`` leaves the Table object registered on ``db.metadata``, so a later
-    up() in the same process fails with "Table is already defined".
+    ``DROP TABLE`` and ``RENAME TO`` only act on the database. The Table object
+    stays registered on ``db.metadata``, so a later up() in the same process
+    raises "Table is already defined for this MetaData instance" when it tries
+    to define it again.
     """
     metadata = getattr(db, "metadata", None)
-    runs_table_name = getattr(db, "runs_table_name", None)
-    if metadata is not None and runs_table_name is not None:
+    if metadata is not None and table_name is not None:
         for table in list(metadata.tables.values()):
-            if table.name == runs_table_name:
+            if table.name == table_name:
                 metadata.remove(table)
-    if hasattr(db, "runs_table"):
-        db.runs_table = None
+    if hasattr(db, attribute):
+        setattr(db, attribute, None)
+
+
+def _forget_runs_table(db) -> None:
+    """Forget the runs table, after a revert has dropped it."""
+    _forget_table(db, getattr(db, "runs_table_name", None), "runs_table")
+
+
+def _forget_metrics_table(db, table_name: str) -> None:
+    """Forget the metrics table, after a rebuild has replaced it."""
+    _forget_table(db, table_name, "metrics_table")
 
 
 def _decode_run_data(value: Any) -> Any:
@@ -418,36 +492,114 @@ async def _async_column_exists(sess, db_schema: str, table_name: str, column_nam
     return result.scalar() is not None
 
 
-def _index_exists(sess, db_schema: str, table_name: str, index_name: str, db_type: str) -> bool:
-    """Check if an index exists on a table."""
+def _index_columns_query(db_type: str) -> Any:
+    """The statement listing the columns an index covers, for this backend."""
     if db_type in ("PostgresDb", "AsyncPostgresDb"):
-        query = text(
-            "SELECT 1 FROM pg_indexes WHERE schemaname = :schema AND tablename = :table AND indexname = :index"
+        return text(
+            "SELECT a.attname FROM pg_class t "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "JOIN pg_index ix ON ix.indrelid = t.oid "
+            "JOIN pg_class i ON i.oid = ix.indexrelid "
+            "JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = :schema AND t.relname = :table AND i.relname = :index "
+            "ORDER BY k.ord"
         )
-    else:
-        # MySQL / SingleStore
-        query = text(
-            "SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS "
-            "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table AND INDEX_NAME = :index"
-        )
-    result = sess.execute(query, {"schema": db_schema, "table": table_name, "index": index_name})
-    return result.scalar() is not None
+    # MySQL / SingleStore
+    return text(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+        "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table AND INDEX_NAME = :index "
+        "ORDER BY SEQ_IN_INDEX"
+    )
 
 
-async def _async_index_exists(sess, db_schema: str, table_name: str, index_name: str, db_type: str) -> bool:
+def _index_exists(
+    sess, db_schema: str, table_name: str, index_name: str, db_type: str, columns: Optional[List[str]] = None
+) -> bool:
+    """Check if an index exists on a table.
+
+    ``columns`` narrows the check to an index that really covers them. The name
+    on its own is not enough: one of that name sitting on other columns would
+    make the migration skip the index it needs, report success, and never come
+    back to it.
+    """
+    result = sess.execute(
+        _index_columns_query(db_type), {"schema": db_schema, "table": table_name, "index": index_name}
+    )
+    found = [row[0] for row in result.fetchall()]
+    if not found:
+        return False
+    return columns is None or sorted(found) == sorted(columns)
+
+
+async def _async_index_exists(
+    sess, db_schema: str, table_name: str, index_name: str, db_type: str, columns: Optional[List[str]] = None
+) -> bool:
     """Async version: check if an index exists on a table."""
-    if db_type in ("PostgresDb", "AsyncPostgresDb"):
-        query = text(
-            "SELECT 1 FROM pg_indexes WHERE schemaname = :schema AND tablename = :table AND indexname = :index"
-        )
-    else:
-        # MySQL / SingleStore
-        query = text(
-            "SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS "
-            "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table AND INDEX_NAME = :index"
-        )
-    result = await sess.execute(query, {"schema": db_schema, "table": table_name, "index": index_name})
+    result = await sess.execute(
+        _index_columns_query(db_type), {"schema": db_schema, "table": table_name, "index": index_name}
+    )
+    found = [row[0] for row in result.fetchall()]
+    if not found:
+        return False
+    return columns is None or sorted(found) == sorted(columns)
+
+
+def _sqlite_table_exists(sess, table_name: str) -> bool:
+    """Whether a table of this name exists in the SQLite database."""
+    return (
+        sess.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:table_name"),
+            {"table_name": table_name},
+        ).scalar()
+        is not None
+    )
+
+
+async def _async_sqlite_table_exists(sess, table_name: str) -> bool:
+    """Async variant of :func:`_sqlite_table_exists`."""
+    result = await sess.execute(
+        text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:table_name"),
+        {"table_name": table_name},
+    )
     return result.scalar() is not None
+
+
+def _sqlite_index_columns(sess, index_name: str) -> List[str]:
+    """The columns a SQLite index covers."""
+    info = sess.execute(text(f"PRAGMA index_info({quote_db_identifier('SqliteDb', index_name)})")).fetchall()
+    return [row[2] for row in info]
+
+
+async def _async_sqlite_index_columns(sess, index_name: str) -> List[str]:
+    """Async variant of :func:`_sqlite_index_columns`."""
+    result = await sess.execute(text(f"PRAGMA index_info({quote_db_identifier('SqliteDb', index_name)})"))
+    return [row[2] for row in result.fetchall()]
+
+
+def _sqlite_has_unique_on(sess, quoted_table: str, columns: List[str]) -> bool:
+    """Whether the table already carries a UNIQUE index over exactly these columns.
+
+    Read from PRAGMA rather than matched against the CREATE TABLE text. A
+    constraint name can appear in that text without being a constraint, since a
+    column or a CHECK can carry it, and an equivalent key can be present under a
+    different name, so a substring test gets both cases wrong.
+    """
+    wanted = sorted(columns)
+    for index in sess.execute(text(f"PRAGMA index_list({quoted_table})")).fetchall():
+        if index[2] and sorted(_sqlite_index_columns(sess, index[1])) == wanted:
+            return True
+    return False
+
+
+async def _async_sqlite_has_unique_on(sess, quoted_table: str, columns: List[str]) -> bool:
+    """Async variant of :func:`_sqlite_has_unique_on`."""
+    wanted = sorted(columns)
+    result = await sess.execute(text(f"PRAGMA index_list({quoted_table})"))
+    for index in result.fetchall():
+        if index[2] and sorted(await _async_sqlite_index_columns(sess, index[1])) == wanted:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2111,12 +2263,8 @@ def _revert_surrealdb(db: BaseDb, table_type: str, table_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _user_id_column_ddl(db, table_type: str) -> Optional[str]:
-    """Compile the user_id column type from the adapter's own schema for this table.
-
-    Returns None when this adapter's schema has no such table, or has it without a
-    user_id column — not every table type exists on every backend.
-    """
+def _table_schema(db, table_type: str) -> Optional[Dict[str, Any]]:
+    """The adapter's own schema definition for this table type, or None if it has none."""
     db_type = type(db).__name__
 
     schemas: Any
@@ -2130,39 +2278,408 @@ def _user_id_column_ddl(db, table_type: str) -> Optional[str]:
         from agno.db.sqlite import schemas
 
     try:
-        column_type = schemas.get_table_schema_definition(table_type)["user_id"]["type"]
+        return schemas.get_table_schema_definition(table_type)
     except (ValueError, KeyError):
         return None
-    return column_type().compile(dialect=db.db_engine.dialect)
+
+
+def _user_id_column_ddl(db, table_type: str) -> Optional[str]:
+    """Compile the user_id column definition from the adapter's own schema for this table.
+
+    A NOT NULL column carries its default too: ``ADD COLUMN ... NOT NULL`` is
+    rejected on a populated table without one. Returns None when this adapter's
+    schema has no such table or no user_id column; the SQL adapters report an
+    unknown table as version 2.0.0 rather than None, so the migration is
+    attempted there and has to bow out here.
+    """
+    table_schema = _table_schema(db, table_type)
+    if table_schema is None or "user_id" not in table_schema:
+        return None
+    column = table_schema["user_id"]
+
+    column_ddl = column["type"]().compile(dialect=db.db_engine.dialect)
+    default = column.get("default")
+    if column.get("nullable") is False and isinstance(default, str):
+        escaped_default = default.replace("'", "''")
+        column_ddl = f"{column_ddl} NOT NULL DEFAULT '{escaped_default}'"
+    return column_ddl
 
 
 def _user_id_composite_indexes(db, table_type: str, table_name: str) -> List[tuple]:
     """Schema-declared composite indexes that include user_id, as (name, columns).
 
-    Names follow the adapters' composite-index convention:
+    These cannot predate the column, so the migration creates them too (the
+    schedules listing path, for one, relies on its (user_id, enabled,
+    next_run_at) index). The names follow the adapters' convention:
     ``idx_{table}_{columns joined with _}``.
     """
-    db_type = type(db).__name__
-
-    schemas: Any
-    if db_type in ("PostgresDb", "AsyncPostgresDb"):
-        from agno.db.postgres import schemas
-    elif db_type in ("MySQLDb", "AsyncMySQLDb"):
-        from agno.db.mysql import schemas
-    elif db_type == "SingleStoreDb":
-        from agno.db.singlestore import schemas
-    else:
-        from agno.db.sqlite import schemas
-
-    try:
-        composites = schemas.get_table_schema_definition(table_type).get("__composite_indexes__", [])
-    except (ValueError, KeyError):
+    table_schema = _table_schema(db, table_type)
+    if table_schema is None:
         return []
+    composites = table_schema.get("__composite_indexes__", [])
     return [
         (f"idx_{table_name}_{'_'.join(idx['columns'])}", list(idx["columns"]))
         for idx in composites
         if "user_id" in idx["columns"]
     ]
+
+
+def _metrics_unique_constraint(db, table_name: str) -> Optional[tuple]:
+    """The metrics unique constraint the adapter declares, as (name, columns).
+
+    Read from the schema rather than hard-coded, so the migration follows the
+    adapter. SingleStore declares none: it rejects a second multi-column UNIQUE
+    alongside the id primary key (error 1706), so it gets the column and nothing
+    else.
+    """
+    table_schema = _table_schema(db, "metrics")
+    if table_schema is None:
+        return None
+    for constraint in table_schema.get("_unique_constraints", []):
+        if "user_id" in constraint["columns"]:
+            # The adapters prefix the declared name with the table name
+            return f"{table_name}_{constraint['name']}", list(constraint["columns"])
+    return None
+
+
+def _reject_overlong_metrics_key(db, table_name: str) -> None:
+    """Refuse a metrics table whose v3.0 unique key name will not fit MySQL's limit.
+
+    Raised before the migration touches the table. The new key goes on before the
+    old one comes off, so hitting the overflow would leave the table with a user_id
+    column and the legacy key still merging owners, and every later ``up()`` would
+    fail at the same statement. PostgreSQL truncates the name to 63 bytes and the
+    per-user upsert targets the key's columns rather than its name, so the first
+    run survives; the truncated name is what ``_index_exists`` then fails to find.
+    """
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is None:
+        return
+    unique_name = declared[0]
+    if len(unique_name) <= MAX_MYSQL_IDENTIFIER_LENGTH:
+        return
+    longest_table = len(table_name) + MAX_MYSQL_IDENTIFIER_LENGTH - len(unique_name)
+    raise ValueError(
+        f"Cannot migrate {table_name}: its v3.0 unique key would be named {unique_name}, which is "
+        f"{len(unique_name)} characters against this database's limit of {MAX_MYSQL_IDENTIFIER_LENGTH}. "
+        f"Rename the metrics table to at most {longest_table} characters and migrate again."
+    )
+
+
+def _sqlite_metrics_ddl(db, table_name: str, with_user_id: bool) -> Optional[tuple]:
+    """The CREATE statements for a metrics table, as (table, indexes).
+
+    Built through SQLAlchemy from the adapter's own schema, so a rebuilt table
+    matches a fresh install. ``with_user_id`` False gives the pre-v3.0 shape.
+    Returns None when this adapter declares no metrics schema or unique key.
+    """
+    from sqlalchemy import Column, Index, MetaData, Table, UniqueConstraint
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    table_schema = _table_schema(db, "metrics")
+    if table_schema is None:
+        return None
+
+    if with_user_id:
+        declared = _metrics_unique_constraint(db, table_name)
+        if declared is None:
+            return None
+        unique_name, unique_columns = declared
+    else:
+        unique_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+        unique_columns = list(METRICS_LEGACY_UNIQUE_COLUMNS)
+
+    columns, indexed = [], []
+    for name, spec in table_schema.items():
+        if name.startswith("_") or (name == "user_id" and not with_user_id):
+            continue
+        columns.append(
+            Column(
+                name,
+                spec["type"](),
+                primary_key=spec.get("primary_key", False),
+                nullable=spec.get("nullable", True),
+            )
+        )
+        if spec.get("index"):
+            indexed.append(name)
+
+    table = Table(table_name, MetaData(), *columns, UniqueConstraint(*unique_columns, name=unique_name))
+    dialect = db.db_engine.dialect
+    return (
+        str(CreateTable(table).compile(dialect=dialect)),
+        [
+            str(CreateIndex(Index(f"idx_{table_name}_{name}", table.c[name])).compile(dialect=dialect))
+            for name in indexed
+        ],
+    )
+
+
+def _is_metrics_shaped(db, columns: List[str]) -> bool:
+    """Whether a table carries the metrics columns, so the rebuild may replace it.
+
+    The rebuild drops and recreates the table, so a mismatched (table_type,
+    table_name) pair has to be refused rather than acted on.
+    """
+    table_schema = _table_schema(db, "metrics")
+    if table_schema is None:
+        return False
+    expected = {name for name in table_schema if not name.startswith("_") and name != "user_id"}
+    return expected.issubset(columns)
+
+
+def _drop_incomplete_metrics_rows(sess, table_name: str, full_table: str) -> None:
+    """Remove the newest unfinished metrics day, as ownership lands.
+
+    Stamped unowned, such a row becomes a bucket the per-user recalculation never
+    rewrites, and the day is counted twice for good. Only the newest day goes,
+    and only when it sits past every completed one: the recalculation resumes at
+    the newest row's date, so that is the one day certain to be rebuilt from
+    sessions. An unfinished day deeper in history stays even though it is stale.
+    Its sessions may be pruned by now, which would make its row the only record
+    of the day, and the recalculation never reaches back to it, so deleting it
+    would lose the day. Restricted to unowned rows, the empty-string sentinel or
+    a hand-patched NULL, so a second replica cannot delete real per-user buckets.
+    """
+    # Separate SELECTs because MySQL cannot subquery the table a DELETE targets
+    last_completed = sess.execute(text(f"SELECT MAX(date) FROM {full_table} WHERE completed = true")).scalar()
+    newest = sess.execute(text(f"SELECT MAX(date) FROM {full_table}")).scalar()
+    if newest is None or (last_completed is not None and newest <= last_completed):
+        return
+    result = sess.execute(
+        text(
+            f"DELETE FROM {full_table} WHERE completed = false AND (user_id = '' OR user_id IS NULL) AND date = :newest"
+        ),
+        {"newest": newest},
+    )
+    if result.rowcount:
+        log_info(f"-- Cleared the unfinished newest metric day from {table_name} so it recalculates per user")
+
+
+async def _async_drop_incomplete_metrics_rows(sess, table_name: str, full_table: str) -> None:
+    """Async variant of :func:`_drop_incomplete_metrics_rows`."""
+    # Separate SELECTs because MySQL cannot subquery the table a DELETE targets
+    result = await sess.execute(text(f"SELECT MAX(date) FROM {full_table} WHERE completed = true"))
+    last_completed = result.scalar()
+    result = await sess.execute(text(f"SELECT MAX(date) FROM {full_table}"))
+    newest = result.scalar()
+    if newest is None or (last_completed is not None and newest <= last_completed):
+        return
+    result = await sess.execute(
+        text(
+            f"DELETE FROM {full_table} WHERE completed = false AND (user_id = '' OR user_id IS NULL) AND date = :newest"
+        ),
+        {"newest": newest},
+    )
+    if result.rowcount:
+        log_info(f"-- Cleared the unfinished newest metric day from {table_name} so it recalculates per user")
+
+
+@contextmanager
+def _sqlite_ddl_transaction(db) -> Iterator[Any]:
+    """A connection on which DDL really does roll back.
+
+    The driver commits DDL as it goes, so an interrupted rebuild would strand the
+    rows in the renamed-aside table. An explicit BEGIN keeps it one unit.
+    """
+    with db.db_engine.connect() as conn:
+        conn.exec_driver_sql("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            conn.exec_driver_sql("ROLLBACK")
+            raise
+        conn.exec_driver_sql("COMMIT")
+
+
+@asynccontextmanager
+async def _async_sqlite_ddl_transaction(db) -> AsyncIterator[Any]:
+    """Async variant of :func:`_sqlite_ddl_transaction`."""
+    async with db.db_engine.connect() as conn:
+        await conn.exec_driver_sql("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            await conn.exec_driver_sql("ROLLBACK")
+            raise
+        await conn.exec_driver_sql("COMMIT")
+
+
+def _swap_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Move the metrics unique key onto (user_id, date, aggregation_period) for PostgreSQL.
+
+    The legacy key is on (date, aggregation_period), so it rejects the second
+    user's row for a date and the per-user upsert has no conflict target to
+    match. The column on its own leaves metrics broken.
+
+    The new key goes on first, so the table is never briefly without one. The old
+    one is then removed both ways: Postgres refuses DROP INDEX on an index a
+    constraint owns, and DROP CONSTRAINT does not see an index someone created by
+    hand under that name, so whichever it is, it goes.
+    """
+    db_type = type(db).__name__
+    applied = False
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is not None:
+        name, columns = declared
+        if not _index_exists(sess, db_schema, table_name, name, db_type, columns):
+            log_info(f"-- Adding unique constraint {name} on {table_name}")
+            # Another process can add the key between the check and this
+            # statement. Postgres has no ADD CONSTRAINT IF NOT EXISTS and a
+            # failure poisons the transaction, so it runs in a savepoint and
+            # is checked again.
+            try:
+                with sess.begin_nested():
+                    sess.execute(
+                        text(
+                            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, name)} "
+                            f"UNIQUE ({', '.join(columns)})"
+                        )
+                    )
+            except Exception:
+                if not _index_exists(sess, db_schema, table_name, name, db_type, columns):
+                    raise
+            applied = True
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if _index_exists(sess, db_schema, table_name, legacy_name, db_type, list(METRICS_LEGACY_UNIQUE_COLUMNS)):
+        log_info(f"-- Dropping legacy unique constraint {legacy_name} from {table_name}")
+        quoted_legacy = quote_db_identifier(db_type, legacy_name)
+        sess.execute(text(f"ALTER TABLE {full_table} DROP CONSTRAINT IF EXISTS {quoted_legacy}"))
+        sess.execute(text(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, db_schema)}.{quoted_legacy}"))
+        applied = True
+
+    return applied
+
+
+async def _swap_async_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async PostgreSQL variant of :func:`_swap_postgres_metrics_unique`."""
+    db_type = type(db).__name__
+    applied = False
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is not None:
+        name, columns = declared
+        if not await _async_index_exists(sess, db_schema, table_name, name, db_type, columns):
+            log_info(f"-- Adding unique constraint {name} on {table_name}")
+            # See _swap_postgres_metrics_unique: the savepoint keeps a key another
+            # process added first from poisoning this transaction
+            try:
+                async with sess.begin_nested():
+                    await sess.execute(
+                        text(
+                            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, name)} "
+                            f"UNIQUE ({', '.join(columns)})"
+                        )
+                    )
+            except Exception:
+                if not await _async_index_exists(sess, db_schema, table_name, name, db_type, columns):
+                    raise
+            applied = True
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if await _async_index_exists(
+        sess, db_schema, table_name, legacy_name, db_type, list(METRICS_LEGACY_UNIQUE_COLUMNS)
+    ):
+        log_info(f"-- Dropping legacy unique constraint {legacy_name} from {table_name}")
+        quoted_legacy = quote_db_identifier(db_type, legacy_name)
+        await sess.execute(text(f"ALTER TABLE {full_table} DROP CONSTRAINT IF EXISTS {quoted_legacy}"))
+        await sess.execute(text(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, db_schema)}.{quoted_legacy}"))
+        applied = True
+
+    return applied
+
+
+def _swap_mysql_like_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """MySQL / SingleStore variant of :func:`_swap_postgres_metrics_unique`.
+
+    MySQL implements a unique constraint as an index, so the legacy key goes with
+    DROP INDEX. SingleStore declares no metrics unique constraint at all (see
+    :func:`_metrics_unique_constraint`) and never carried the legacy one either, so
+    there is nothing to drop and nothing to add.
+
+    The new key goes on before the old one comes off. MySQL commits each ALTER on
+    its own, so dropping first would leave a table with no unique key at all if
+    the add then failed, and neither ``up`` nor ``down`` could put it back.
+    """
+    db_type = type(db).__name__
+    applied = False
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is not None:
+        name, columns = declared
+        if not _index_exists(sess, db_schema, table_name, name, db_type, columns):
+            log_info(f"-- Adding unique constraint {name} on {table_name}")
+            quoted_columns = ", ".join(quote_db_identifier(db_type, column) for column in columns)
+            # Another process can add the key between the check and this
+            # statement. MySQL has no ADD CONSTRAINT IF NOT EXISTS, so on
+            # failure the check is made again: the key is there either way.
+            try:
+                sess.execute(
+                    text(
+                        f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, name)} "
+                        f"UNIQUE ({quoted_columns})"
+                    )
+                )
+            except Exception:
+                if not _index_exists(sess, db_schema, table_name, name, db_type, columns):
+                    raise
+            applied = True
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if _index_exists(sess, db_schema, table_name, legacy_name, db_type, list(METRICS_LEGACY_UNIQUE_COLUMNS)):
+        log_info(f"-- Dropping legacy unique constraint {legacy_name} from {table_name}")
+        # Another process can drop the key between the check and this statement.
+        # MySQL has no DROP INDEX IF EXISTS, so on failure the check is made
+        # again: the key is gone either way.
+        try:
+            sess.execute(text(f"DROP INDEX {quote_db_identifier(db_type, legacy_name)} ON {full_table}"))
+        except Exception:
+            if _index_exists(sess, db_schema, table_name, legacy_name, db_type):
+                raise
+        applied = True
+
+    return applied
+
+
+async def _swap_async_mysql_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async MySQL variant of :func:`_swap_mysql_like_metrics_unique`."""
+    db_type = type(db).__name__
+    applied = False
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is not None:
+        name, columns = declared
+        if not await _async_index_exists(sess, db_schema, table_name, name, db_type, columns):
+            log_info(f"-- Adding unique constraint {name} on {table_name}")
+            quoted_columns = ", ".join(quote_db_identifier(db_type, column) for column in columns)
+            # See _swap_mysql_like_metrics_unique: a key another process added
+            # first is not a reason to fail the migration
+            try:
+                await sess.execute(
+                    text(
+                        f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, name)} "
+                        f"UNIQUE ({quoted_columns})"
+                    )
+                )
+            except Exception:
+                if not await _async_index_exists(sess, db_schema, table_name, name, db_type, columns):
+                    raise
+            applied = True
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if await _async_index_exists(
+        sess, db_schema, table_name, legacy_name, db_type, list(METRICS_LEGACY_UNIQUE_COLUMNS)
+    ):
+        log_info(f"-- Dropping legacy unique constraint {legacy_name} from {table_name}")
+        # Another process can drop the key between the check and this statement.
+        # MySQL has no DROP INDEX IF EXISTS, so on failure the check is made
+        # again: the key is gone either way.
+        try:
+            await sess.execute(text(f"DROP INDEX {quote_db_identifier(db_type, legacy_name)} ON {full_table}"))
+        except Exception:
+            if await _async_index_exists(sess, db_schema, table_name, legacy_name, db_type):
+                raise
+        applied = True
+
+    return applied
 
 
 def _migrate_postgres_user_id(db: BaseDb, table_type: str, table_name: str) -> bool:
@@ -2191,15 +2708,38 @@ def _migrate_postgres_user_id(db: BaseDb, table_type: str, table_name: str) -> b
             return False
 
         applied = False
+        column_added = False
 
         if not _column_exists(sess, db_schema, table_name, "user_id", db_type):
             log_info(f"-- Adding user_id column to {table_name}")
-            sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN user_id {column_ddl}"))
+            # IF NOT EXISTS because a second process migrating this table can add
+            # the column between the check above and the statement below, and a
+            # replica booting alongside another should not die over work that is
+            # already done
+            sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS user_id {column_ddl}"))
+            column_added = True
             applied = True
 
-        if not _index_exists(sess, db_schema, table_name, index_name, db_type):
+        if table_type == "metrics":
+            # The key swap runs before the indexes: its ALTERs take ACCESS
+            # EXCLUSIVE while CREATE INDEX takes SHARE, and two replicas that
+            # both took SHARE first deadlock waiting on each other's upgrade.
+            # Strongest lock first keeps them serialized.
+            key_swapped = _swap_postgres_metrics_unique(sess, db, db_schema, table_name, full_table)
+            if key_swapped:
+                applied = True
+            # A hand-added user_id column skips the branch above, so the delete
+            # keys off the key swap too: either one signals a table
+            # mid-migration. On a no-op re-run neither fires, so a legitimate
+            # current-day unowned bucket is left alone.
+            if column_added or key_swapped:
+                _drop_incomplete_metrics_rows(sess, table_name, full_table)
+
+        if not _index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
             log_info(f"-- Adding index {index_name} on {table_name}")
-            sess.execute(text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (user_id)"))
+            sess.execute(
+                text(f"CREATE INDEX IF NOT EXISTS {quote_db_identifier(db_type, index_name)} ON {full_table} (user_id)")
+            )
             applied = True
 
         for comp_name, comp_cols in _user_id_composite_indexes(db, table_type, table_name):
@@ -2210,7 +2750,8 @@ def _migrate_postgres_user_id(db: BaseDb, table_type: str, table_name: str) -> b
                 log_info(f"-- Adding index {comp_name} on {table_name}")
                 sess.execute(
                     text(
-                        f"CREATE INDEX {quote_db_identifier(db_type, comp_name)} ON {full_table} ({', '.join(comp_cols)})"
+                        f"CREATE INDEX IF NOT EXISTS {quote_db_identifier(db_type, comp_name)} "
+                        f"ON {full_table} ({', '.join(comp_cols)})"
                     )
                 )
                 applied = True
@@ -2244,16 +2785,31 @@ async def _migrate_async_postgres_user_id(db: AsyncBaseDb, table_type: str, tabl
             return False
 
         applied = False
+        column_added = False
 
         if not await _async_column_exists(sess, db_schema, table_name, "user_id", db_type):
             log_info(f"-- Adding user_id column to {table_name}")
-            await sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN user_id {column_ddl}"))
+            # See _migrate_postgres_user_id: IF NOT EXISTS lets two replicas
+            # migrate the same table at once
+            await sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN IF NOT EXISTS user_id {column_ddl}"))
+            column_added = True
             applied = True
 
-        if not await _async_index_exists(sess, db_schema, table_name, index_name, db_type):
+        if table_type == "metrics":
+            # See _migrate_postgres_user_id: the key swap's ACCESS EXCLUSIVE
+            # comes before CREATE INDEX's SHARE, or two replicas deadlock
+            key_swapped = await _swap_async_postgres_metrics_unique(sess, db, db_schema, table_name, full_table)
+            if key_swapped:
+                applied = True
+            # See _migrate_postgres_user_id: a hand-added column skips the
+            # branch above, so the delete keys off the key swap too
+            if column_added or key_swapped:
+                await _async_drop_incomplete_metrics_rows(sess, table_name, full_table)
+
+        if not await _async_index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
             log_info(f"-- Adding index {index_name} on {table_name}")
             await sess.execute(
-                text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (user_id)")
+                text(f"CREATE INDEX IF NOT EXISTS {quote_db_identifier(db_type, index_name)} ON {full_table} (user_id)")
             )
             applied = True
 
@@ -2270,7 +2826,8 @@ async def _migrate_async_postgres_user_id(db: AsyncBaseDb, table_type: str, tabl
                 log_info(f"-- Adding index {comp_name} on {table_name}")
                 await sess.execute(
                     text(
-                        f"CREATE INDEX {quote_db_identifier(db_type, comp_name)} ON {full_table} ({', '.join(comp_cols)})"
+                        f"CREATE INDEX IF NOT EXISTS {quote_db_identifier(db_type, comp_name)} "
+                        f"ON {full_table} ({', '.join(comp_cols)})"
                     )
                 )
                 applied = True
@@ -2285,6 +2842,8 @@ def _migrate_mysql_like_user_id(db: BaseDb, table_type: str, table_name: str) ->
     column_ddl = _user_id_column_ddl(db, table_type)
     if column_ddl is None:
         return False
+    if table_type == "metrics":
+        _reject_overlong_metrics_key(db, table_name)
 
     with db.Session() as sess, sess.begin():  # type: ignore
         # SingleStore leaves db_schema as None and uses the connection's database
@@ -2306,16 +2865,43 @@ def _migrate_mysql_like_user_id(db: BaseDb, table_type: str, table_name: str) ->
             return False
 
         applied = False
+        column_added = False
 
         if not _column_exists(sess, db_schema, table_name, "user_id", db_type):
             log_info(f"-- Adding user_id column to {table_name}")
-            sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN `user_id` {column_ddl}"))
+            # Another process migrating this table can add the column between the
+            # check above and the statement below. MySQL has no ADD COLUMN IF NOT
+            # EXISTS, so the check is simply made again: the column is there
+            # either way, and a replica booting alongside another should not die
+            # over work that is already done.
+            try:
+                sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN `user_id` {column_ddl}"))
+            except Exception:
+                if not _column_exists(sess, db_schema, table_name, "user_id", db_type):
+                    raise
+            column_added = True
             applied = True
 
-        if not _index_exists(sess, db_schema, table_name, index_name, db_type):
+        if not _index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
             log_info(f"-- Adding index {index_name} on {table_name}")
-            sess.execute(text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)"))
+            # See the column above: another process may have created it first
+            try:
+                sess.execute(
+                    text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)")
+                )
+            except Exception:
+                if not _index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
+                    raise
             applied = True
+
+        if table_type == "metrics":
+            key_swapped = _swap_mysql_like_metrics_unique(sess, db, db_schema, table_name, full_table)
+            if key_swapped:
+                applied = True
+            # See _migrate_postgres_user_id: a hand-added column skips the
+            # branch above, so the delete keys off the key swap too
+            if column_added or key_swapped:
+                _drop_incomplete_metrics_rows(sess, table_name, full_table)
 
         return applied
 
@@ -2327,6 +2913,8 @@ async def _migrate_async_mysql_user_id(db: AsyncBaseDb, table_type: str, table_n
     column_ddl = _user_id_column_ddl(db, table_type)
     if column_ddl is None:
         return False
+    if table_type == "metrics":
+        _reject_overlong_metrics_key(db, table_name)
 
     async with db.async_session_factory() as sess, sess.begin():  # type: ignore
         db_schema = db.db_schema or (await sess.execute(text("SELECT DATABASE()"))).scalar()  # type: ignore
@@ -2349,20 +2937,261 @@ async def _migrate_async_mysql_user_id(db: AsyncBaseDb, table_type: str, table_n
             return False
 
         applied = False
+        column_added = False
 
         if not await _async_column_exists(sess, db_schema, table_name, "user_id", db_type):
             log_info(f"-- Adding user_id column to {table_name}")
-            await sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN `user_id` {column_ddl}"))
+            # See _migrate_mysql_like_user_id: a column another process added
+            # first is not a reason to fail the migration
+            try:
+                await sess.execute(text(f"ALTER TABLE {full_table} ADD COLUMN `user_id` {column_ddl}"))
+            except Exception:
+                if not await _async_column_exists(sess, db_schema, table_name, "user_id", db_type):
+                    raise
+            column_added = True
             applied = True
 
-        if not await _async_index_exists(sess, db_schema, table_name, index_name, db_type):
+        if not await _async_index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
             log_info(f"-- Adding index {index_name} on {table_name}")
-            await sess.execute(
-                text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)")
-            )
+            # See the column above: another process may have created it first
+            try:
+                await sess.execute(
+                    text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)")
+                )
+            except Exception:
+                if not await _async_index_exists(sess, db_schema, table_name, index_name, db_type, ["user_id"]):
+                    raise
             applied = True
+
+        if table_type == "metrics":
+            key_swapped = await _swap_async_mysql_metrics_unique(sess, db, db_schema, table_name, full_table)
+            if key_swapped:
+                applied = True
+            # See _migrate_postgres_user_id: a hand-added column skips the
+            # branch above, so the delete keys off the key swap too
+            if column_added or key_swapped:
+                await _async_drop_incomplete_metrics_rows(sess, table_name, full_table)
 
         return applied
+
+
+def _sqlite_metrics_rebuild_plan(db, table_name: str, table_info: List[tuple], index_rows: List[tuple]) -> tuple:
+    """Work out what a rebuild has to carry over, as (carried, extra, extra_indexes).
+
+    ``carried`` are the schema's own columns that the live table has, ``extra``
+    the ones an operator added, kept rather than dropped, since the rebuild is
+    the only thing standing between them and being gone. ``extra_indexes`` are
+    the index statements the schema will not recreate.
+    """
+    table_schema = _table_schema(db, "metrics") or {}
+    schema_columns = {name for name in table_schema if not name.startswith("_")}
+    indexed = {f"idx_{table_name}_{name}" for name in schema_columns if table_schema[name].get("index")}
+
+    carried = [col[1] for col in table_info if col[1] in schema_columns and col[1] != "user_id"]
+    extra = [col for col in table_info if col[1] not in schema_columns]
+    extra_indexes = [row[1] for row in index_rows if row[0] not in indexed]
+    return carried, extra, extra_indexes
+
+
+def _sqlite_extra_column_ddl(quoted_table: str, extra: List[tuple]) -> List[str]:
+    """ADD COLUMN statements putting an operator's own metrics columns back.
+
+    The rebuild replaces the table, so a column the schema does not know about
+    would be gone with the rows in it. A NOT NULL column is only reproduced as
+    NOT NULL when it carries a default: SQLite has no other way to fill it for
+    the rows copied in.
+    """
+    statements = []
+    for column in extra:
+        name, column_type, notnull, default = column[1], column[2] or "TEXT", column[3], column[4]
+        clause = f"ALTER TABLE {quoted_table} ADD COLUMN {quote_db_identifier('SqliteDb', name)} {column_type}"
+        if default is not None:
+            clause += f" DEFAULT {default}"
+            if notnull:
+                clause += " NOT NULL"
+        log_info(f"-- Carrying over column {name} on {quoted_table}")
+        statements.append(clause)
+    return statements
+
+
+def _migrate_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) -> bool:
+    """Rebuild the metrics table so its unique key includes user_id, for SQLite.
+
+    SQLite writes UNIQUE into the CREATE TABLE statement and has no
+    ``ALTER TABLE ... DROP CONSTRAINT``, so the legacy key can only go by
+    rebuilding the table. The replacement is compiled from the adapter's own
+    schema, and the rebuild is one transaction: it lands, or the original table
+    is left exactly as it was.
+    """
+    if table_type != "metrics":
+        return False
+
+    declared = _metrics_unique_constraint(db, table_name)
+    ddl = _sqlite_metrics_ddl(db, table_name, with_user_id=True)
+    if declared is None or ddl is None:
+        return False
+    unique_columns = declared[1]
+    create_sql, index_sqls = ddl
+
+    db_type = type(db).__name__
+    backup_name = f"{table_name}_pre_v3_0_0"
+    quoted_table = quote_db_identifier(db_type, table_name)
+    quoted_backup = quote_db_identifier(db_type, backup_name)
+
+    with db.Session() as sess:  # type: ignore
+        if not _sqlite_table_exists(sess, table_name):
+            log_info(f"Table {table_name} does not exist, skipping migration")
+            return False
+        if _sqlite_has_unique_on(sess, quoted_table, unique_columns):
+            return False
+
+        table_info = sess.execute(text(f"PRAGMA table_info({quoted_table})")).fetchall()
+        # The rebuild replaces the table, so refuse one that is not shaped like
+        # metrics rather than act on a mismatched (table_type, table_name) pair
+        if not _is_metrics_shaped(db, [col[1] for col in table_info]):
+            log_warning(
+                f"Table {table_name} is not shaped like a metrics table, so it keeps its pre-v3.0 shape "
+                "and metrics writes against it will fail. Point metrics_table at the right table, or add "
+                "the columns the schema declares, then migrate again with force=True."
+            )
+            return False
+        index_rows = sess.execute(
+            text("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=:t AND sql IS NOT NULL"),
+            {"t": table_name},
+        ).fetchall()
+        # A hand-made UNIQUE index over the key columns would put the legacy
+        # key straight back and reject the second owner's row, so it is not
+        # replayed. Mirrors the revert, which does not replay user_id indexes.
+        unique_names = {idx[1] for idx in sess.execute(text(f"PRAGMA index_list({quoted_table})")).fetchall() if idx[2]}
+        kept_indexes = [
+            row
+            for row in index_rows
+            if row[0] not in unique_names or not set(_sqlite_index_columns(sess, row[0])) <= set(unique_columns)
+        ]
+
+    carried, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    copied = carried + [col[1] for col in extra]
+    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in copied)
+    # Rows written before ownership existed belong to the unowned bucket
+    owner_sql = "COALESCE(user_id, '')" if "user_id" in [col[1] for col in table_info] else "''"
+
+    log_info(f"-- Rebuilding {table_name} to move its unique key onto user_id")
+    with _sqlite_ddl_transaction(db) as conn:
+        conn.exec_driver_sql(f"ALTER TABLE {quoted_table} RENAME TO {quoted_backup}")
+        # Index names are unique across the database, so the old ones have to go
+        # before the same names are created on the new table
+        for index_row in index_rows:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, index_row[0])}")
+
+        conn.exec_driver_sql(create_sql)
+        for statement in _sqlite_extra_column_ddl(quoted_table, extra) + index_sqls + extra_indexes:
+            conn.exec_driver_sql(statement)
+
+        conn.exec_driver_sql(
+            f"INSERT INTO {quoted_table} ({copied_sql}, user_id) SELECT {copied_sql}, {owner_sql} FROM {quoted_backup}"
+        )
+        # A row for a day still in progress holds that day's traffic for every
+        # user. Stamping it unowned would leave a bucket the per-user recalculation
+        # never targets, so the admin view would count the day twice. Only the
+        # newest unfinished day goes, and only when it sits past every completed
+        # one: the recalculation resumes at the newest row's date, so that is the
+        # one day certain to be rebuilt from sessions. An unfinished day deeper
+        # in history stays; its sessions may be pruned by now, which would make
+        # its row the only record of the day. Completed days are frozen and stay
+        # as they are.
+        conn.exec_driver_sql(
+            f"DELETE FROM {quoted_table} WHERE completed = 0 AND user_id = '' "
+            f"AND date = (SELECT MAX(date) FROM {quoted_table}) "
+            f"AND date > COALESCE((SELECT MAX(date) FROM {quoted_table} WHERE completed = 1), '')"
+        )
+        conn.exec_driver_sql(f"DROP TABLE {quoted_backup}")
+
+    _forget_metrics_table(db, table_name)
+    return True
+
+
+async def _migrate_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, table_name: str) -> bool:
+    """Async SQLite variant of :func:`_migrate_sqlite_metrics_table`."""
+    if table_type != "metrics":
+        return False
+
+    declared = _metrics_unique_constraint(db, table_name)
+    ddl = _sqlite_metrics_ddl(db, table_name, with_user_id=True)
+    if declared is None or ddl is None:
+        return False
+    unique_columns = declared[1]
+    create_sql, index_sqls = ddl
+
+    db_type = type(db).__name__
+    backup_name = f"{table_name}_pre_v3_0_0"
+    quoted_table = quote_db_identifier(db_type, table_name)
+    quoted_backup = quote_db_identifier(db_type, backup_name)
+
+    async with db.async_session_factory() as sess:  # type: ignore
+        if not await _async_sqlite_table_exists(sess, table_name):
+            log_info(f"Table {table_name} does not exist, skipping migration")
+            return False
+        if await _async_sqlite_has_unique_on(sess, quoted_table, unique_columns):
+            return False
+
+        result = await sess.execute(text(f"PRAGMA table_info({quoted_table})"))
+        table_info = result.fetchall()
+        # The rebuild replaces the table, so refuse one that is not shaped like
+        # metrics rather than act on a mismatched (table_type, table_name) pair
+        if not _is_metrics_shaped(db, [col[1] for col in table_info]):
+            log_warning(
+                f"Table {table_name} is not shaped like a metrics table, so it keeps its pre-v3.0 shape "
+                "and metrics writes against it will fail. Point metrics_table at the right table, or add "
+                "the columns the schema declares, then migrate again with force=True."
+            )
+            return False
+        result = await sess.execute(
+            text("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=:t AND sql IS NOT NULL"),
+            {"t": table_name},
+        )
+        index_rows = result.fetchall()
+        # See _migrate_sqlite_metrics_table: a hand-made UNIQUE index over the
+        # key columns would put the legacy key straight back, so it is not replayed
+        result = await sess.execute(text(f"PRAGMA index_list({quoted_table})"))
+        unique_names = {idx[1] for idx in result.fetchall() if idx[2]}
+        kept_indexes = [
+            row
+            for row in index_rows
+            if row[0] not in unique_names
+            or not set(await _async_sqlite_index_columns(sess, row[0])) <= set(unique_columns)
+        ]
+
+    carried, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    copied = carried + [col[1] for col in extra]
+    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in copied)
+    # Rows written before ownership existed belong to the unowned bucket
+    owner_sql = "COALESCE(user_id, '')" if "user_id" in [col[1] for col in table_info] else "''"
+
+    log_info(f"-- Rebuilding {table_name} to move its unique key onto user_id")
+    async with _async_sqlite_ddl_transaction(db) as conn:
+        statements = [f"ALTER TABLE {quoted_table} RENAME TO {quoted_backup}"]
+        # Index names are unique across the database, so the old ones have to go
+        # before the same names are created on the new table
+        statements += [f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, row[0])}" for row in index_rows]
+        statements.append(create_sql)
+        statements += _sqlite_extra_column_ddl(quoted_table, extra) + index_sqls + extra_indexes
+        for statement in statements:
+            await conn.exec_driver_sql(statement)
+
+        await conn.exec_driver_sql(
+            f"INSERT INTO {quoted_table} ({copied_sql}, user_id) SELECT {copied_sql}, {owner_sql} FROM {quoted_backup}"
+        )
+        # See _migrate_sqlite_metrics_table: only the newest unfinished day goes,
+        # and the per-user recalculation rebuilds it from sessions
+        await conn.exec_driver_sql(
+            f"DELETE FROM {quoted_table} WHERE completed = 0 AND user_id = '' "
+            f"AND date = (SELECT MAX(date) FROM {quoted_table}) "
+            f"AND date > COALESCE((SELECT MAX(date) FROM {quoted_table} WHERE completed = 1), '')"
+        )
+        await conn.exec_driver_sql(f"DROP TABLE {quoted_backup}")
+
+    _forget_metrics_table(db, table_name)
+    return True
 
 
 def _migrate_sqlite_user_id(db: BaseDb, table_type: str, table_name: str) -> bool:
@@ -2468,6 +3297,196 @@ async def _migrate_async_sqlite_user_id(db: AsyncBaseDb, table_type: str, table_
         return applied
 
 
+def _metrics_revert_is_blocked(sess, table_name: str, full_table: str) -> bool:
+    """True when metrics holds owned rows, which makes dropping user_id lossy.
+
+    Two owners' buckets for a date collapse into duplicate (date,
+    aggregation_period) rows the moment the column goes, and the legacy unique
+    key can no longer be put back. A NULL counts as owned: the column is NOT
+    NULL, so a NULL means something outside the migration has been at the table.
+    """
+    owned = sess.execute(text(f"SELECT 1 FROM {full_table} WHERE user_id <> '' OR user_id IS NULL LIMIT 1")).scalar()
+    if owned is None:
+        return False
+    log_warning(
+        f"Skipping revert of {table_name}: it holds per-user metric rows, and dropping user_id would "
+        "merge them into duplicates for the same date. Consolidate or delete the owned rows first."
+    )
+    return True
+
+
+async def _async_metrics_revert_is_blocked(sess, table_name: str, full_table: str) -> bool:
+    """Async variant of :func:`_metrics_revert_is_blocked`."""
+    result = await sess.execute(text(f"SELECT 1 FROM {full_table} WHERE user_id <> '' OR user_id IS NULL LIMIT 1"))
+    if result.scalar() is None:
+        return False
+    log_warning(
+        f"Skipping revert of {table_name}: it holds per-user metric rows, and dropping user_id would "
+        "merge them into duplicates for the same date. Consolidate or delete the owned rows first."
+    )
+    return True
+
+
+def _drop_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Drop the v3.0 metrics unique key for PostgreSQL.
+
+    The key covers user_id, so it has to go before the column can be dropped; the
+    legacy key goes back afterwards (:func:`_restore_postgres_metrics_unique`).
+    """
+    db_type = type(db).__name__
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is None:
+        return False
+
+    unique_name = declared[0]
+    if not _index_exists(sess, db_schema, table_name, unique_name, db_type):
+        return False
+    log_info(f"-- Dropping unique constraint {unique_name} from {table_name}")
+    # Both ways round, for the same reason as the up path: DROP CONSTRAINT does
+    # not see an index created by hand under that name, and DROP INDEX is refused
+    # on one a constraint owns.
+    quoted_unique = quote_db_identifier(db_type, unique_name)
+    sess.execute(text(f"ALTER TABLE {full_table} DROP CONSTRAINT IF EXISTS {quoted_unique}"))
+    sess.execute(text(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, db_schema)}.{quoted_unique}"))
+    return True
+
+
+async def _drop_async_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async PostgreSQL variant of :func:`_drop_postgres_metrics_unique`."""
+    db_type = type(db).__name__
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is None:
+        return False
+
+    unique_name = declared[0]
+    if not await _async_index_exists(sess, db_schema, table_name, unique_name, db_type):
+        return False
+    log_info(f"-- Dropping unique constraint {unique_name} from {table_name}")
+    # See _drop_postgres_metrics_unique: the name can be either a constraint or a
+    # hand-created index, and each is dropped by the statement the other refuses.
+    quoted_unique = quote_db_identifier(db_type, unique_name)
+    await sess.execute(text(f"ALTER TABLE {full_table} DROP CONSTRAINT IF EXISTS {quoted_unique}"))
+    await sess.execute(text(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, db_schema)}.{quoted_unique}"))
+    return True
+
+
+def _restore_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Put the metrics unique key back on (date, aggregation_period) for PostgreSQL.
+
+    A table with no unique key at all would break the v2 upsert's ON CONFLICT.
+    Safe only because the revert refuses while any row is owned.
+    """
+    db_type = type(db).__name__
+    if _metrics_unique_constraint(db, table_name) is None:
+        return False
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if _index_exists(sess, db_schema, table_name, legacy_name, db_type):
+        return False
+    log_info(f"-- Restoring legacy unique constraint {legacy_name} on {table_name}")
+    sess.execute(
+        text(
+            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, legacy_name)} "
+            f"UNIQUE ({', '.join(METRICS_LEGACY_UNIQUE_COLUMNS)})"
+        )
+    )
+    return True
+
+
+async def _restore_async_postgres_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async PostgreSQL variant of :func:`_restore_postgres_metrics_unique`."""
+    db_type = type(db).__name__
+    if _metrics_unique_constraint(db, table_name) is None:
+        return False
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if await _async_index_exists(sess, db_schema, table_name, legacy_name, db_type):
+        return False
+    log_info(f"-- Restoring legacy unique constraint {legacy_name} on {table_name}")
+    await sess.execute(
+        text(
+            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, legacy_name)} "
+            f"UNIQUE ({', '.join(METRICS_LEGACY_UNIQUE_COLUMNS)})"
+        )
+    )
+    return True
+
+
+def _drop_mysql_like_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """MySQL / SingleStore variant of :func:`_drop_postgres_metrics_unique`."""
+    db_type = type(db).__name__
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is None:
+        return False
+
+    unique_name = declared[0]
+    if not _index_exists(sess, db_schema, table_name, unique_name, db_type):
+        return False
+    log_info(f"-- Dropping unique constraint {unique_name} from {table_name}")
+    sess.execute(text(f"DROP INDEX {quote_db_identifier(db_type, unique_name)} ON {full_table}"))
+    return True
+
+
+async def _drop_async_mysql_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async MySQL variant of :func:`_drop_mysql_like_metrics_unique`."""
+    db_type = type(db).__name__
+    declared = _metrics_unique_constraint(db, table_name)
+    if declared is None:
+        return False
+
+    unique_name = declared[0]
+    if not await _async_index_exists(sess, db_schema, table_name, unique_name, db_type):
+        return False
+    log_info(f"-- Dropping unique constraint {unique_name} from {table_name}")
+    await sess.execute(text(f"DROP INDEX {quote_db_identifier(db_type, unique_name)} ON {full_table}"))
+    return True
+
+
+def _restore_mysql_like_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """MySQL / SingleStore variant of :func:`_restore_postgres_metrics_unique`.
+
+    Restored last, after the column is gone: MySQL commits each ALTER on its own, so
+    a failed DROP COLUMN leaves the table without a key rather than with one that
+    merges owners.
+    """
+    db_type = type(db).__name__
+    if _metrics_unique_constraint(db, table_name) is None:
+        return False
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if _index_exists(sess, db_schema, table_name, legacy_name, db_type):
+        return False
+    log_info(f"-- Restoring legacy unique constraint {legacy_name} on {table_name}")
+    quoted_columns = ", ".join(quote_db_identifier(db_type, column) for column in METRICS_LEGACY_UNIQUE_COLUMNS)
+    sess.execute(
+        text(
+            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, legacy_name)} "
+            f"UNIQUE ({quoted_columns})"
+        )
+    )
+    return True
+
+
+async def _restore_async_mysql_metrics_unique(sess, db, db_schema: str, table_name: str, full_table: str) -> bool:
+    """Async MySQL variant of :func:`_restore_mysql_like_metrics_unique`."""
+    db_type = type(db).__name__
+    if _metrics_unique_constraint(db, table_name) is None:
+        return False
+
+    legacy_name = f"{table_name}_{METRICS_LEGACY_UNIQUE_NAME}"
+    if await _async_index_exists(sess, db_schema, table_name, legacy_name, db_type):
+        return False
+    log_info(f"-- Restoring legacy unique constraint {legacy_name} on {table_name}")
+    quoted_columns = ", ".join(quote_db_identifier(db_type, column) for column in METRICS_LEGACY_UNIQUE_COLUMNS)
+    await sess.execute(
+        text(
+            f"ALTER TABLE {full_table} ADD CONSTRAINT {quote_db_identifier(db_type, legacy_name)} "
+            f"UNIQUE ({quoted_columns})"
+        )
+    )
+    return True
+
+
 def _revert_postgres_user_id(db: BaseDb, table_type: str, table_name: str) -> bool:
     """Drop the user_id column from the given table for PostgreSQL."""
     db_schema = db.db_schema or "ai"  # type: ignore
@@ -2490,16 +3509,27 @@ def _revert_postgres_user_id(db: BaseDb, table_type: str, table_name: str) -> bo
             log_info(f"Table {table_name} does not exist, skipping revert")
             return False
 
+        is_metrics = table_type == "metrics"
+        column_exists = _column_exists(sess, db_schema, table_name, "user_id", db_type)
+        if is_metrics and column_exists and _metrics_revert_is_blocked(sess, table_name, full_table):
+            return False
+
         applied = False
+
+        if is_metrics and _drop_postgres_metrics_unique(sess, db, db_schema, table_name, full_table):
+            applied = True
 
         if _index_exists(sess, db_schema, table_name, index_name, db_type):
             log_info(f"-- Dropping index {index_name} from {table_name}")
             sess.execute(text(f"DROP INDEX {quoted_schema}.{quote_db_identifier(db_type, index_name)}"))
             applied = True
 
-        if _column_exists(sess, db_schema, table_name, "user_id", db_type):
+        if column_exists:
             log_info(f"-- Dropping user_id column from {table_name}")
             sess.execute(text(f"ALTER TABLE {full_table} DROP COLUMN user_id"))
+            applied = True
+
+        if is_metrics and _restore_postgres_metrics_unique(sess, db, db_schema, table_name, full_table):
             applied = True
 
         return applied
@@ -2527,16 +3557,27 @@ async def _revert_async_postgres_user_id(db: AsyncBaseDb, table_type: str, table
             log_info(f"Table {table_name} does not exist, skipping revert")
             return False
 
+        is_metrics = table_type == "metrics"
+        column_exists = await _async_column_exists(sess, db_schema, table_name, "user_id", db_type)
+        if is_metrics and column_exists and await _async_metrics_revert_is_blocked(sess, table_name, full_table):
+            return False
+
         applied = False
+
+        if is_metrics and await _drop_async_postgres_metrics_unique(sess, db, db_schema, table_name, full_table):
+            applied = True
 
         if await _async_index_exists(sess, db_schema, table_name, index_name, db_type):
             log_info(f"-- Dropping index {index_name} from {table_name}")
             await sess.execute(text(f"DROP INDEX {quoted_schema}.{quote_db_identifier(db_type, index_name)}"))
             applied = True
 
-        if await _async_column_exists(sess, db_schema, table_name, "user_id", db_type):
+        if column_exists:
             log_info(f"-- Dropping user_id column from {table_name}")
             await sess.execute(text(f"ALTER TABLE {full_table} DROP COLUMN user_id"))
+            applied = True
+
+        if is_metrics and await _restore_async_postgres_metrics_unique(sess, db, db_schema, table_name, full_table):
             applied = True
 
         return applied
@@ -2566,7 +3607,16 @@ def _revert_mysql_like_user_id(db: BaseDb, table_type: str, table_name: str) -> 
             log_info(f"Table {table_name} does not exist, skipping revert")
             return False
 
+        is_metrics = table_type == "metrics"
+        column_exists = _column_exists(sess, db_schema, table_name, "user_id", db_type)
+        if is_metrics and column_exists and _metrics_revert_is_blocked(sess, table_name, full_table):
+            return False
+
         applied = False
+
+        dropped_unique = is_metrics and _drop_mysql_like_metrics_unique(sess, db, db_schema, table_name, full_table)
+        if dropped_unique:
+            applied = True
 
         dropped_index = False
         if _index_exists(sess, db_schema, table_name, index_name, db_type):
@@ -2575,17 +3625,26 @@ def _revert_mysql_like_user_id(db: BaseDb, table_type: str, table_name: str) -> 
             dropped_index = True
             applied = True
 
-        if _column_exists(sess, db_schema, table_name, "user_id", db_type):
+        if column_exists:
             log_info(f"-- Dropping user_id column from {table_name}")
             try:
                 sess.execute(text(f"ALTER TABLE {full_table} DROP COLUMN `user_id`"))
             except Exception:
-                # MySQL and SingleStore commit DDL immediately, so the index drop above stuck.
+                # MySQL and SingleStore commit DDL immediately, so the drops above
+                # already stuck. Put them back rather than leave the column in
+                # place with nothing keeping two owners' buckets apart.
                 if dropped_index:
                     sess.execute(
                         text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)")
                     )
+                if dropped_unique:
+                    _swap_mysql_like_metrics_unique(sess, db, db_schema, table_name, full_table)
                 raise
+            applied = True
+
+        # The legacy key only goes back once user_id is gone: it cannot hold
+        # while two owners still have a row for the same date
+        if is_metrics and _restore_mysql_like_metrics_unique(sess, db, db_schema, table_name, full_table):
             applied = True
 
         return applied
@@ -2616,7 +3675,18 @@ async def _revert_async_mysql_user_id(db: AsyncBaseDb, table_type: str, table_na
             log_info(f"Table {table_name} does not exist, skipping revert")
             return False
 
+        is_metrics = table_type == "metrics"
+        column_exists = await _async_column_exists(sess, db_schema, table_name, "user_id", db_type)
+        if is_metrics and column_exists and await _async_metrics_revert_is_blocked(sess, table_name, full_table):
+            return False
+
         applied = False
+
+        dropped_unique = is_metrics and await _drop_async_mysql_metrics_unique(
+            sess, db, db_schema, table_name, full_table
+        )
+        if dropped_unique:
+            applied = True
 
         dropped_index = False
         if await _async_index_exists(sess, db_schema, table_name, index_name, db_type):
@@ -2625,20 +3695,142 @@ async def _revert_async_mysql_user_id(db: AsyncBaseDb, table_type: str, table_na
             dropped_index = True
             applied = True
 
-        if await _async_column_exists(sess, db_schema, table_name, "user_id", db_type):
+        if column_exists:
             log_info(f"-- Dropping user_id column from {table_name}")
             try:
                 await sess.execute(text(f"ALTER TABLE {full_table} DROP COLUMN `user_id`"))
             except Exception:
-                # MySQL commits DDL immediately, so the index drop above already stuck.
+                # MySQL commits DDL immediately, so the drops above already stuck.
+                # Put them back rather than leave the column in place with nothing
+                # keeping two owners' buckets apart.
                 if dropped_index:
                     await sess.execute(
                         text(f"CREATE INDEX {quote_db_identifier(db_type, index_name)} ON {full_table} (`user_id`)")
                     )
+                if dropped_unique:
+                    await _swap_async_mysql_metrics_unique(sess, db, db_schema, table_name, full_table)
                 raise
             applied = True
 
+        # See _revert_mysql_like_user_id: the legacy key only goes back once
+        # user_id is gone
+        if is_metrics and await _restore_async_mysql_metrics_unique(sess, db, db_schema, table_name, full_table):
+            applied = True
+
         return applied
+
+
+def _revert_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) -> bool:
+    """Rebuild the metrics table back to its pre-v3.0 shape, for SQLite.
+
+    The mirror of :func:`_migrate_sqlite_metrics_table`: SQLite cannot drop the
+    v3.0 key or a column it covers, so the only way back is another rebuild in
+    one transaction. Indexes covering user_id are not replayed.
+    """
+    if table_type != "metrics":
+        return False
+
+    declared = _metrics_unique_constraint(db, table_name)
+    ddl = _sqlite_metrics_ddl(db, table_name, with_user_id=False)
+    if declared is None or ddl is None:
+        return False
+    unique_columns = declared[1]
+    legacy_ddl, legacy_index_sqls = ddl
+
+    db_type = type(db).__name__
+    backup_name = f"{table_name}_pre_v3_0_0"
+    quoted_table = quote_db_identifier(db_type, table_name)
+    quoted_backup = quote_db_identifier(db_type, backup_name)
+
+    with db.Session() as sess:  # type: ignore
+        if not _sqlite_table_exists(sess, table_name):
+            log_info(f"Table {table_name} does not exist, skipping revert")
+            return False
+        if not _sqlite_has_unique_on(sess, quoted_table, unique_columns):
+            return False
+        if _metrics_revert_is_blocked(sess, table_name, quoted_table):
+            return False
+
+        table_info = sess.execute(text(f"PRAGMA table_info({quoted_table})")).fetchall()
+        index_rows = sess.execute(
+            text("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=:t AND sql IS NOT NULL"),
+            {"t": table_name},
+        ).fetchall()
+        kept_indexes = [row for row in index_rows if "user_id" not in _sqlite_index_columns(sess, row[0])]
+
+    _, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    carried = [col[1] for col in table_info if col[1] != "user_id"]
+    carried_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
+
+    log_info(f"-- Rebuilding {table_name} back to its pre-v3.0.0 unique key")
+    with _sqlite_ddl_transaction(db) as conn:
+        conn.exec_driver_sql(f"ALTER TABLE {quoted_table} RENAME TO {quoted_backup}")
+        for index_row in index_rows:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, index_row[0])}")
+
+        conn.exec_driver_sql(legacy_ddl)
+        for statement in _sqlite_extra_column_ddl(quoted_table, extra) + legacy_index_sqls + extra_indexes:
+            conn.exec_driver_sql(statement)
+
+        conn.exec_driver_sql(f"INSERT INTO {quoted_table} ({carried_sql}) SELECT {carried_sql} FROM {quoted_backup}")
+        conn.exec_driver_sql(f"DROP TABLE {quoted_backup}")
+
+    _forget_metrics_table(db, table_name)
+    return True
+
+
+async def _revert_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, table_name: str) -> bool:
+    """Async SQLite variant of :func:`_revert_sqlite_metrics_table`."""
+    if table_type != "metrics":
+        return False
+
+    declared = _metrics_unique_constraint(db, table_name)
+    ddl = _sqlite_metrics_ddl(db, table_name, with_user_id=False)
+    if declared is None or ddl is None:
+        return False
+    unique_columns = declared[1]
+    legacy_ddl, legacy_index_sqls = ddl
+
+    db_type = type(db).__name__
+    backup_name = f"{table_name}_pre_v3_0_0"
+    quoted_table = quote_db_identifier(db_type, table_name)
+    quoted_backup = quote_db_identifier(db_type, backup_name)
+
+    async with db.async_session_factory() as sess:  # type: ignore
+        if not await _async_sqlite_table_exists(sess, table_name):
+            log_info(f"Table {table_name} does not exist, skipping revert")
+            return False
+        if not await _async_sqlite_has_unique_on(sess, quoted_table, unique_columns):
+            return False
+        if await _async_metrics_revert_is_blocked(sess, table_name, quoted_table):
+            return False
+
+        result = await sess.execute(text(f"PRAGMA table_info({quoted_table})"))
+        table_info = result.fetchall()
+        result = await sess.execute(
+            text("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=:t AND sql IS NOT NULL"),
+            {"t": table_name},
+        )
+        index_rows = result.fetchall()
+        kept_indexes = [row for row in index_rows if "user_id" not in await _async_sqlite_index_columns(sess, row[0])]
+
+    _, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    carried = [col[1] for col in table_info if col[1] != "user_id"]
+    carried_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
+
+    log_info(f"-- Rebuilding {table_name} back to its pre-v3.0.0 unique key")
+    async with _async_sqlite_ddl_transaction(db) as conn:
+        statements = [f"ALTER TABLE {quoted_table} RENAME TO {quoted_backup}"]
+        statements += [f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, row[0])}" for row in index_rows]
+        statements.append(legacy_ddl)
+        statements += _sqlite_extra_column_ddl(quoted_table, extra) + legacy_index_sqls + extra_indexes
+        statements.append(f"INSERT INTO {quoted_table} ({carried_sql}) SELECT {carried_sql} FROM {quoted_backup}")
+        statements.append(f"DROP TABLE {quoted_backup}")
+        for statement in statements:
+            await conn.exec_driver_sql(statement)
+
+    _forget_metrics_table(db, table_name)
+    return True
 
 
 def _revert_sqlite_user_id(db: BaseDb, table_type: str, table_name: str) -> bool:

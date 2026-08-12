@@ -114,7 +114,8 @@ METRICS_TABLE_SCHEMA = {
     "date": {"type": Date, "nullable": False, "index": True},
     "aggregation_period": {"type": lambda: String(20), "nullable": False},
     # Empty string, not NULL, for "no owner": MySQL treats NULLs as distinct in a unique index.
-    "user_id": {"type": lambda: String(128), "nullable": False, "default": "", "index": True},
+    # Binary collation: the server default is case-insensitive and would fold "alice" and "ALICE" into one row.
+    "user_id": {"type": lambda: String(128, collation="utf8mb4_bin"), "nullable": False, "default": "", "index": True},
     "created_at": {"type": BigInteger, "nullable": False},
     "updated_at": {"type": BigInteger, "nullable": True},
     "completed": {"type": Boolean, "nullable": False, "default": False},

@@ -2042,7 +2042,9 @@ class MySQLDb(BaseDb):
             Optional[date]: The starting date for which metrics calculation is needed.
         """
         with self.Session() as sess:
-            stmt = select(table).order_by(table.c.date.desc()).limit(1)
+            # Incomplete first on tied dates, so a day with per-user rows still
+            # needing recalculation is not skipped over
+            stmt = select(table).order_by(table.c.date.desc(), table.c.completed.asc()).limit(1)
             result = sess.execute(stmt).fetchone()
 
             # 1. Return the date of the first day without a complete metrics record.
@@ -2110,27 +2112,45 @@ class MySQLDb(BaseDb):
 
             results = []
             metrics_records = []
+            dates_without_sessions = []
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
+                # A date with no sessions contributes no records, and the sweep
+                # inside ``bulk_upsert_metrics`` only reaches the pairs it is
+                # handed records for: clear its leftover rows below instead.
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
+                    dates_without_sessions.append(date_to_process)
                     continue
 
                 # One record per distinct user_id, plus an empty-string bucket for unowned sessions
                 metrics_records.extend(calculate_date_metrics(date_to_process, sessions_for_date))
 
-            if metrics_records:
+            if metrics_records or dates_without_sessions:
                 with self.Session() as sess, sess.begin():
-                    results = bulk_upsert_metrics(session=sess, table=table, metrics_records=metrics_records)
+                    if metrics_records:
+                        results = bulk_upsert_metrics(session=sess, table=table, metrics_records=metrics_records)
+
+                    # A date churned to zero sessions still holds buckets from a previous
+                    # pass. Snapshot-select then delete by primary key, the same shape the
+                    # sweep in ``bulk_upsert_metrics`` uses: a ranged DELETE next-key locks
+                    # and deadlocks against a concurrent recalculation's upserts.
+                    if dates_without_sessions:
+                        stale_ids_stmt = select(table.c.id).where(
+                            table.c.date.in_(dates_without_sessions),
+                            table.c.aggregation_period == "daily",
+                        )
+                        stale_ids = sorted(row[0] for row in sess.execute(stale_ids_stmt))
+                        if stale_ids:
+                            sess.execute(table.delete().where(table.c.id.in_(stale_ids)))
 
             return results
 
         except Exception as e:
             log_error(f"Exception refreshing metrics: {str(e)}")
-            return None
+            raise e
 
     def get_metrics(
         self,

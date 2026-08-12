@@ -2227,7 +2227,9 @@ class AsyncPostgresDb(AsyncBaseDb):
             Optional[date]: The starting date for which metrics calculation is needed.
         """
         async with self.async_session_factory() as sess:
-            stmt = select(table).order_by(table.c.date.desc()).limit(1)
+            # Incomplete first on tied dates, so a day with per-user rows still
+            # needing recalculation is not skipped over
+            stmt = select(table).order_by(table.c.date.desc(), table.c.completed.asc()).limit(1)
             result = await sess.execute(stmt)
             row = result.fetchone()
 
@@ -2321,7 +2323,7 @@ class AsyncPostgresDb(AsyncBaseDb):
 
         except Exception as e:
             log_error(f"Exception refreshing metrics: {str(e)}")
-            return None
+            raise e
 
     async def get_metrics(
         self,

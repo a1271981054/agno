@@ -1765,7 +1765,11 @@ class FirestoreDb(BaseDb):
         """Get all sessions of all types for metrics calculation."""
         try:
             collection_ref = self._get_collection(table_type="sessions")
-            runs_collection_ref = self._get_collection(table_type="runs", create_collection_if_not_found=False)
+            # create_collection_if_not_found=False returns None whenever this instance
+            # has not initialized the runs handle, not only when the collection is
+            # missing: a fresh replica would count zero runs and overwrite the run
+            # counts and model metrics with zeros
+            runs_collection_ref = self._get_collection(table_type="runs", create_collection_if_not_found=True)
 
             query = collection_ref
             if start_timestamp is not None:
@@ -1885,13 +1889,17 @@ class FirestoreDb(BaseDb):
 
             results = []
             metrics_records = []
+            dates_without_sessions = []
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
+                # A date with no sessions contributes no records, and the sweep
+                # inside ``bulk_upsert_metrics`` only reaches the dates it is
+                # given records for: clear its leftover documents below instead.
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
+                    dates_without_sessions.append(date_key)
                     continue
 
                 # One record per distinct user_id, plus the empty-string bucket for unowned sessions.
@@ -1899,6 +1907,12 @@ class FirestoreDb(BaseDb):
 
             if metrics_records:
                 results = bulk_upsert_metrics(collection_ref, metrics_records)
+
+            # A date churned to zero sessions still holds documents from a previous pass.
+            for date_key in dates_without_sessions:
+                for doc in collection_ref.where(filter=FieldFilter("date", "==", date_key)).stream():
+                    if (doc.to_dict() or {}).get("aggregation_period") == "daily":
+                        doc.reference.delete()
 
             log_debug("Updated metrics calculations")
 

@@ -1660,22 +1660,18 @@ class DynamoDb(BaseDb):
                 return None
 
             # Calculate metrics for each date
-            results = []
             metrics_records = []
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
-                if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
-                    continue
-
-                # One record per user_id, plus the empty-string bucket for unowned sessions
+                # One record per user_id. An empty date yields none — the
+                # sweep inside the bulk upsert clears its buckets.
                 metrics_records.extend(calculate_date_metrics(date_to_process, sessions_for_date))
 
-            # Store metrics in DynamoDB
-            if metrics_records:
-                results = self._bulk_upsert_metrics(metrics_records)
+            # Store metrics in DynamoDB. Runs even with no records to store:
+            # the superseded sweep covers every date in the window.
+            results = self._bulk_upsert_metrics(metrics_records, dates_to_process)
 
             log_debug("Updated metrics calculations")
 
@@ -1840,11 +1836,14 @@ class DynamoDb(BaseDb):
             log_error(f"Failed to get sessions for metrics calculation: {str(e)}")
             raise e
 
-    def _bulk_upsert_metrics(self, metrics_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _bulk_upsert_metrics(
+        self, metrics_records: List[Dict[str, Any]], dates_to_process: List[date]
+    ) -> List[Dict[str, Any]]:
         """Bulk upsert metrics records into DynamoDB with proper deduplication.
 
         Args:
             metrics_records: List of metrics records to upsert
+            dates_to_process: The recalculation window the records were built from
 
         Returns:
             List[Dict[str, Any]]: List of upserted records
@@ -1862,11 +1861,82 @@ class DynamoDb(BaseDb):
                 if upserted_record:
                     results.append(upserted_record)
 
+            # Clear what this recalculation supersedes. No transaction here, so this
+            # runs after the fresh set is in place — a crash between the two leaves a
+            # stale record only a later window covering that date can sweep.
+            self._delete_superseded_metrics_records(table_name, metrics_records, dates_to_process)
+
             return results
 
         except Exception as e:
             log_error(f"Failed to bulk upsert metrics: {str(e)}")
             raise e
+
+    def _delete_superseded_metrics_records(
+        self, table_name: str, metrics_records: List[Dict[str, Any]], dates_to_process: List[date]
+    ) -> None:
+        """Delete the metrics records the given recalculation supersedes.
+
+        An owner still holding a (date, aggregation_period) bucket this recalculation
+        wrote has no sessions left on that date, and its stale record would be summed
+        on top of the fresh ones, the pre-user_id ``uuid4``-id record included. Every
+        date in the window sweeps, sessions or not: a date churned to zero sessions
+        produces no fresh records, and each bucket it still holds is stale.
+
+        Reads the ``date-aggregation_period-index`` GSI, one Query per pair instead
+        of a whole-table scan. The GSI is eventually consistent, but a stale view is
+        harmless here: a fresh record's id encodes its (date, user_id), so the index
+        can only still list an id this pass just rewrote — excluded via
+        ``written_ids`` — or one already deleted, and deleting again is a no-op. A
+        record the index does not list yet is simply left for the next recalculation.
+
+        Args:
+            table_name: The DynamoDB metrics table name
+            metrics_records: The freshly calculated metrics records
+            dates_to_process: The recalculation window the records were built from
+        """
+        owners_per_pair: Dict[tuple, set] = {
+            (date_to_process.isoformat(), "daily"): set() for date_to_process in dates_to_process
+        }
+        written_ids = set()
+        for record in metrics_records:
+            record_date = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
+            owners_per_pair.setdefault((record_date, record["aggregation_period"]), set()).add(
+                record.get("user_id", "")
+            )
+            written_ids.add(record.get("id"))
+
+        if not owners_per_pair:
+            return
+
+        superseded_ids = []
+        for (record_date, aggregation_period), owners in owners_per_pair.items():
+            query_kwargs: Dict[str, Any] = {
+                "TableName": table_name,
+                "IndexName": "date-aggregation_period-index",
+                "KeyConditionExpression": "#date = :date AND aggregation_period = :period",
+                "ProjectionExpression": "id, #date, aggregation_period, user_id",
+                "ExpressionAttributeNames": {"#date": "date"},
+                "ExpressionAttributeValues": {":date": {"S": record_date}, ":period": {"S": aggregation_period}},
+            }
+            response = self.client.query(**query_kwargs)
+            items = response.get("Items", [])
+            while "LastEvaluatedKey" in response:
+                query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+                response = self.client.query(**query_kwargs)
+                items.extend(response.get("Items", []))
+
+            for item in items:
+                existing = deserialize_from_dynamodb_item(item)
+                if not existing.get("id") or existing["id"] in written_ids:
+                    continue
+                if existing.get("user_id") not in owners:
+                    superseded_ids.append(existing["id"])
+
+        for i in range(0, len(superseded_ids), DYNAMO_BATCH_SIZE_LIMIT):
+            batch = superseded_ids[i : i + DYNAMO_BATCH_SIZE_LIMIT]
+            delete_requests = [{"DeleteRequest": {"Key": {"id": {"S": metric_id}}}} for metric_id in batch]
+            batch_write_with_retry(self.client, {table_name: delete_requests})
 
     def _upsert_single_metrics_record(self, table_name: str, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Upsert a single metrics record.

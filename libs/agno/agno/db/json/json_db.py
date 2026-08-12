@@ -28,6 +28,7 @@ from agno.db.utils import (
     deserialize_session,
     deserialize_sessions,
     filter_context_runs,
+    is_superseded_metrics_record,
     merge_runs_table_with_legacy_blob,
 )
 from agno.run.agent import RunOutput
@@ -1136,17 +1137,28 @@ class JsonDb(BaseDb):
                 return None
 
             results = []
+            swept_stale_record = False
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
-                if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
-                    continue
+                # One record per user_id. An empty date yields none — the sweep below clears its buckets.
+                date_records = calculate_date_metrics(date_to_process, sessions_for_date)
 
-                # Upsert one metrics record per user_id
-                for metrics_record in calculate_date_metrics(date_to_process, sessions_for_date):
+                owners = {record["user_id"] for record in date_records}
+                size_before_sweep = len(metrics)
+                metrics = [
+                    existing_metric
+                    for existing_metric in metrics
+                    if not is_superseded_metrics_record(existing_metric, date_to_process, owners)
+                ]
+                # A date can sweep without producing fresh records, contributing nothing
+                # to ``results`` — the file still has to be written.
+                if len(metrics) != size_before_sweep:
+                    swept_stale_record = True
+
+                for metrics_record in date_records:
                     existing_record_idx = None
                     for i, existing_metric in enumerate(metrics):
                         if (
@@ -1164,7 +1176,7 @@ class JsonDb(BaseDb):
 
                     results.append(metrics_record)
 
-            if results:
+            if results or swept_stale_record:
                 self._write_json_file(self.metrics_table_name, metrics)
 
             log_debug("Updated metrics calculations")

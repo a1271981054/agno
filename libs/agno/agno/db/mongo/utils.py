@@ -8,15 +8,26 @@ from uuid import uuid4
 
 from agno.db.mongo.schemas import get_collection_indexes
 from agno.db.schemas.culture import CulturalKnowledge
-from agno.utils.log import log_error, log_warning
+from agno.utils.log import log_error, log_info, log_warning
 
 try:
     from pymongo.collection import Collection
+    from pymongo.errors import OperationFailure
 except ImportError:
     raise ImportError("`pymongo` not installed. Please install it using `pip install pymongo`")
 
 if TYPE_CHECKING:
     from agno.db.mongo.async_mongo import AsyncMongoCollectionType
+
+
+# The pre-user_id metrics unique key. ``create_index`` never removes it, so on an
+# upgraded deployment it rejects every per-user bucket after the first until the
+# drop below.
+OBSOLETE_METRICS_INDEX = "date_1_aggregation_period_1"
+
+# MongoDB's IndexNotFound. Replicas booting together all see the obsolete index
+# and all try to drop it; whoever loses the race gets this and has nothing to do.
+INDEX_NOT_FOUND = 27
 
 
 # -- DB util methods --
@@ -32,6 +43,16 @@ def create_collection_indexes(collection: Collection, collection_type: str) -> N
                 collection.create_index(key, unique=unique)
             else:
                 collection.create_index([(key, 1)], unique=unique)
+
+        if collection_type == "metrics" and OBSOLETE_METRICS_INDEX in collection.index_information():
+            try:
+                collection.drop_index(OBSOLETE_METRICS_INDEX)
+                log_info(
+                    f"Dropped obsolete metrics index {OBSOLETE_METRICS_INDEX}, superseded by the per-user unique key"
+                )
+            except OperationFailure as e:
+                if e.code != INDEX_NOT_FOUND:
+                    log_warning(f"Could not drop obsolete metrics index {OBSOLETE_METRICS_INDEX}: {str(e)}")
 
     except Exception as e:
         log_warning(f"Error creating indexes for {collection_type} collection: {str(e)}")
@@ -49,6 +70,16 @@ async def create_collection_indexes_async(collection: Any, collection_type: str)
                 await collection.create_index(key, unique=unique)
             else:
                 await collection.create_index([(key, 1)], unique=unique)
+
+        if collection_type == "metrics" and OBSOLETE_METRICS_INDEX in await collection.index_information():
+            try:
+                await collection.drop_index(OBSOLETE_METRICS_INDEX)
+                log_info(
+                    f"Dropped obsolete metrics index {OBSOLETE_METRICS_INDEX}, superseded by the per-user unique key"
+                )
+            except OperationFailure as e:
+                if e.code != INDEX_NOT_FOUND:
+                    log_warning(f"Could not drop obsolete metrics index {OBSOLETE_METRICS_INDEX}: {str(e)}")
 
     except Exception as e:
         log_warning(f"Error creating indexes for {collection_type} collection: {str(e)}")
@@ -205,6 +236,38 @@ def get_dates_to_calculate_metrics_for(starting_date: date) -> list[date]:
     return [starting_date + timedelta(days=x) for x in range(days_diff)]
 
 
+def _superseded_metrics_filter(metrics_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the filter matching the buckets the given records supersede.
+
+    An owner still holding a (date, aggregation_period) pair this recalculation
+    wrote has no sessions left on that date, and its stale document would be
+    summed on top of the fresh ones. ``$nin`` also matches the pre-user_id
+    document, which carries no ``user_id`` field at all.
+
+    Args:
+        metrics_records (List[Dict[str, Any]]): The freshly calculated metrics records.
+
+    Returns:
+        The delete filter, scoped to the pairs being written.
+    """
+    owners_per_pair: Dict[tuple, set] = {}
+    for record in metrics_records:
+        record_date = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
+        owners_per_pair.setdefault((record_date, record["aggregation_period"]), set()).add(record.get("user_id", ""))
+
+    # ``key=str`` keeps the sort total: nothing coerces user_id, and one non-str owner would make a bare sort raise.
+    return {
+        "$or": [
+            {
+                "date": record_date,
+                "aggregation_period": aggregation_period,
+                "user_id": {"$nin": sorted(owners, key=str)},
+            }
+            for (record_date, aggregation_period), owners in owners_per_pair.items()
+        ]
+    }
+
+
 def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Bulk upsert metrics into the database.
 
@@ -222,22 +285,33 @@ def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, 
     for record in metrics_records:
         record["date"] = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
         try:
-            # Legacy records have no ``user_id``, so default to the empty-string sentinel bucket
-            collection.replace_one(
-                {
-                    "user_id": record.get("user_id", ""),
-                    "date": record["date"],
-                    "aggregation_period": record["aggregation_period"],
-                },
-                record,
-                upsert=True,
-            )
+            # The unique key is (user_id, date, aggregation_period). Legacy records
+            # default to the empty-string sentinel so they still match a single bucket.
+            key_filter = {
+                "user_id": record.get("user_id", ""),
+                "date": record["date"],
+                "aggregation_period": record["aggregation_period"],
+            }
 
+            # ``replace_one`` swaps the whole document, so carry over id and
+            # created_at from the replaced document, like the SQL adapters' ON CONFLICT.
+            existing = collection.find_one(key_filter, {"id": 1, "created_at": 1})
+            if existing is not None:
+                record["id"] = existing.get("id", record["id"])
+                record["created_at"] = existing.get("created_at", record["created_at"])
+
+            collection.replace_one(key_filter, record, upsert=True)
             results.append(record)
 
         except Exception as e:
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
+
+    # Clear what this recalculation supersedes. No transaction here, so this runs
+    # after the fresh set is in place: a crash leaves a stale bucket over the day's
+    # total, never a date with no metrics. Only a later window covering that date
+    # can sweep it, and a completed day is not revisited.
+    collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results
 
@@ -261,22 +335,33 @@ async def abulk_upsert_metrics(
     for record in metrics_records:
         record["date"] = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
         try:
-            # Legacy records have no ``user_id``, so default to the empty-string sentinel bucket
-            await collection.replace_one(
-                {
-                    "user_id": record.get("user_id", ""),
-                    "date": record["date"],
-                    "aggregation_period": record["aggregation_period"],
-                },
-                record,
-                upsert=True,
-            )
+            # The unique key is (user_id, date, aggregation_period). Legacy records
+            # default to the empty-string sentinel so they still match a single bucket.
+            key_filter = {
+                "user_id": record.get("user_id", ""),
+                "date": record["date"],
+                "aggregation_period": record["aggregation_period"],
+            }
 
+            # ``replace_one`` swaps the whole document, so carry over id and
+            # created_at from the replaced document, like the SQL adapters' ON CONFLICT.
+            existing = await collection.find_one(key_filter, {"id": 1, "created_at": 1})
+            if existing is not None:
+                record["id"] = existing.get("id", record["id"])
+                record["created_at"] = existing.get("created_at", record["created_at"])
+
+            await collection.replace_one(key_filter, record, upsert=True)
             results.append(record)
 
         except Exception as e:
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
+
+    # Clear what this recalculation supersedes. No transaction here, so this runs
+    # after the fresh set is in place: a crash leaves a stale bucket over the day's
+    # total, never a date with no metrics. Only a later window covering that date
+    # can sweep it, and a completed day is not revisited.
+    await collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results
 

@@ -2192,13 +2192,17 @@ class AsyncMongoDb(AsyncBaseDb):
 
             results = []
             metrics_records = []
+            dates_without_sessions = []
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # Skip dates with no sessions
+                # A date with no sessions contributes no records, and the sweep
+                # inside ``abulk_upsert_metrics`` only reaches the dates it is
+                # given records for: clear its leftover buckets below instead.
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
+                    dates_without_sessions.append(date_key)
                     continue
 
                 # One record per user_id, plus the empty-string bucket for unowned sessions
@@ -2206,6 +2210,10 @@ class AsyncMongoDb(AsyncBaseDb):
 
             if metrics_records:
                 results = await abulk_upsert_metrics(collection, metrics_records)
+
+            # A date churned to zero sessions still holds buckets from a previous pass.
+            if dates_without_sessions:
+                await collection.delete_many({"date": {"$in": dates_without_sessions}, "aggregation_period": "daily"})
 
             return results
 

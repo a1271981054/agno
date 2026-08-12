@@ -2468,7 +2468,9 @@ class PostgresDb(BaseDb):
             Optional[date]: The starting date for which metrics calculation is needed.
         """
         with self.Session() as sess:
-            stmt = select(table).order_by(table.c.date.desc()).limit(1)
+            # Incomplete first on tied dates, so a day with per-user rows still
+            # needing recalculation is not skipped over
+            stmt = select(table).order_by(table.c.date.desc(), table.c.completed.asc()).limit(1)
             result = sess.execute(stmt).fetchone()
 
             # 1. Return the date of the first day without a complete metrics record.

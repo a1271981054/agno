@@ -12,7 +12,8 @@ from agno.db.singlestore.schemas import get_table_schema_definition
 from agno.utils.log import log_debug, log_error, log_warning
 
 try:
-    from sqlalchemy import Table, func
+    from sqlalchemy import Table, and_, func, or_, select
+    from sqlalchemy.dialects import mysql
     from sqlalchemy.inspection import inspect
     from sqlalchemy.orm import Session
     from sqlalchemy.sql.expression import text
@@ -153,8 +154,74 @@ def is_valid_table(db_engine: Engine, table_name: str, table_type: str, db_schem
 
 
 # -- Metrics util methods --
+# Per-user aggregation: the bucket key is (user_id, date, aggregation_period), enforced
+# by ``bulk_upsert_metrics`` rather than a UNIQUE index — see ``schemas.py``.
+# Unowned sessions aggregate under the sentinel empty-string user_id.
+def _superseded_metrics_delete(table: Table, metrics_records: list[dict]):
+    """Build the DELETE clearing the buckets the given records supersede.
+
+    An owner still holding a (date, aggregation_period) pair this recalculation
+    wrote has no sessions left on that date, and its stale row would be summed on
+    top of the fresh ones. Where MySQL's sweep spares the owners being rewritten,
+    this clears EVERY row for those pairs: SingleStore has no unique key on metrics,
+    so a repeated calculation can already have left several rows per bucket.
+
+    Args:
+        table (Table): The metrics table.
+        metrics_records (list[dict]): The freshly calculated metrics records.
+
+    Returns:
+        The DELETE statement, scoped to the pairs being written.
+    """
+    return table.delete().where(_superseded_metrics_pairs(table, metrics_records))
+
+
+def _superseded_metrics_pairs(table: Table, metrics_records: list[dict]):
+    """Match every row for the (date, aggregation_period) pairs being written."""
+    pairs = {(record["date"], record["aggregation_period"]) for record in metrics_records}
+
+    return or_(
+        *[
+            and_(table.c.date == date_to_process, table.c.aggregation_period == aggregation_period)
+            for date_to_process, aggregation_period in pairs
+        ]
+    )
+
+
+def _existing_metrics_identity(session: Session, table: Table, metrics_records: list[dict]) -> Dict[tuple, tuple]:
+    """Each bucket's current id and created_at, keyed by (user_id, date, period).
+
+    The delete clears whole pairs, so every record is written fresh afterwards
+    and would otherwise take a new ``uuid4`` id and a new ``created_at`` on every
+    refresh: a client polling /metrics would watch the id change under it, and
+    created_at would stop meaning when the bucket was first written. SingleStore
+    has no unique key to stop a bucket holding several rows, so the earliest
+    created_at wins and its id comes with it.
+    """
+    rows = session.execute(
+        select(table.c.user_id, table.c.date, table.c.aggregation_period, table.c.id, table.c.created_at).where(
+            _superseded_metrics_pairs(table, metrics_records)
+        )
+    ).fetchall()
+
+    identity: Dict[tuple, tuple] = {}
+    for user_id, date_value, aggregation_period, row_id, created_at in rows:
+        key = (user_id, date_value, aggregation_period)
+        current = identity.get(key)
+        if current is None or (created_at is not None and current[1] is not None and created_at < current[1]):
+            identity[key] = (row_id, created_at)
+    return identity
+
+
 def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[dict]) -> list[dict]:
     """Bulk upsert metrics into the database with proper duplicate handling.
+
+    SingleStore has no unique key on (user_id, date, aggregation_period), so
+    there is no conflict target to upsert against: the buckets being rewritten
+    are cleared and written fresh instead. Each one keeps the id and created_at
+    it already had, so only the numbers move. The id PRIMARY KEY is the one
+    conflict a concurrent refresh can still hit — both refreshes carry the same
+    stored id — and that collision updates in place instead of raising.
 
     Args:
         table (Table): The table to upsert into.
@@ -166,56 +233,31 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
     if not metrics_records:
         return []
 
+    carried = _existing_metrics_identity(session, table, metrics_records)
+
+    # Clears every row for the (date, aggregation_period) pairs being rewritten.
+    # Committed together with the writes below, so a crash can't leave a date with no metrics.
+    session.execute(_superseded_metrics_delete(table, metrics_records))
+
     results = []
-
     for record in metrics_records:
-        user_id_val = record.get("user_id", "")
-        date_val = record.get("date")
-        period_val = record.get("aggregation_period")
+        key = (record.get("user_id", ""), record.get("date"), record.get("aggregation_period"))
+        existing_identity = carried.get(key)
+        if existing_identity is not None:
+            record = {**record, "id": existing_identity[0], "created_at": existing_identity[1]}
 
-        # Check if record already exists based on user_id + date + aggregation_period
-        existing_record = (
-            session.query(table)
-            .filter(
-                table.c.user_id == user_id_val,
-                table.c.date == date_val,
-                table.c.aggregation_period == period_val,
-            )
-            .first()
-        )
-
-        if existing_record:
-            # Update existing record
-            update_data = {
-                k: v
-                for k, v in record.items()
-                if k not in ["id", "date", "aggregation_period", "created_at", "user_id"]
+        # An overlapping refresh can land between our delete and this write, so a plain
+        # INSERT would crash on the id PRIMARY KEY. Update in place on conflict instead.
+        stmt = mysql.insert(table).values(**record)
+        stmt = stmt.on_duplicate_key_update(
+            **{
+                col.name: record.get(col.name)
+                for col in table.columns
+                if col.name not in ["id", "date", "created_at", "aggregation_period", "user_id"] and col.name in record
             }
-            update_data["updated_at"] = record.get("updated_at")
-
-            session.query(table).filter(
-                table.c.user_id == user_id_val,
-                table.c.date == date_val,
-                table.c.aggregation_period == period_val,
-            ).update(update_data)
-
-            # Get the updated record for return
-            updated_record = (
-                session.query(table)
-                .filter(
-                    table.c.user_id == user_id_val,
-                    table.c.date == date_val,
-                    table.c.aggregation_period == period_val,
-                )
-                .first()
-            )
-            if updated_record:
-                results.append(dict(updated_record._mapping))
-        else:
-            # Insert new record
-            stmt = table.insert().values(**record)
-            session.execute(stmt)
-            results.append(record)
+        )
+        session.execute(stmt)
+        results.append(record)
 
     session.commit()
     return results

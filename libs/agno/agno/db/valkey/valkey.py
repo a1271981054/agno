@@ -1878,8 +1878,7 @@ class ValkeyDb(BaseDb):
                     if success:
                         results.append(metrics_record)
 
-                # ``existing_metrics`` predates the writes above, so skip the keys
-                # just written.
+                # ``existing_metrics`` predates the writes above, so skip the keys just written.
                 owners = {record["user_id"] for record in date_records}
                 written_ids = {record["id"] for record in date_records}
                 for stale_record in existing_metrics:
