@@ -2468,8 +2468,7 @@ class PostgresDb(BaseDb):
             Optional[date]: The starting date for which metrics calculation is needed.
         """
         with self.Session() as sess:
-            # Incomplete first on tied dates, so a day with per-user rows still
-            # needing recalculation is not skipped over
+            # Incomplete first on tied dates, so a day still needing per-user recalculation is not skipped
             stmt = select(table).order_by(table.c.date.desc(), table.c.completed.asc()).limit(1)
             result = sess.execute(stmt).fetchone()
 

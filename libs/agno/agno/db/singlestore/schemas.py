@@ -119,8 +119,8 @@ METRICS_TABLE_SCHEMA = {
     "date": {"type": Date, "nullable": False, "index": True},
     "aggregation_period": {"type": lambda: String(20), "nullable": False, "index": True},
     # Owner of this metric bucket. ``""`` instead of ``NULL`` for "no owner", so lookup keys stay comparable.
-    # ``get_metrics`` maps ``""`` back to ``None``. Binary collation: the server default is case-insensitive
-    # and would fold "alice" and "ALICE" into one bucket.
+    # ``get_metrics`` maps ``""`` back to ``None``.
+    # Binary collation: the server default is case-insensitive and would fold "alice" and "ALICE" into one bucket.
     "user_id": {"type": lambda: String(128, collation="utf8mb4_bin"), "nullable": False, "default": "", "index": True},
     "created_at": {"type": BigInteger, "nullable": False},
     "updated_at": {"type": BigInteger, "nullable": True},

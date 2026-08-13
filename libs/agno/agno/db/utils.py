@@ -488,10 +488,9 @@ def metric_record_day(record: Dict[str, Any]) -> Optional[date]:
 
 
 def is_superseded_metrics_record(record: Dict[str, Any], day: date, owners: Set[str]) -> bool:
-    """Whether a stored record is a daily bucket for ``day`` the fresh calculation no longer produces.
+    """Whether a stored record is a daily bucket for ``day`` no longer owned by ``owners``.
 
-    An owner with no sessions left that day is stale, and the unscoped metrics
-    aggregate would sum it on top of the fresh records.
+    Such a record is stale, and the unscoped metrics aggregate would sum it on top of the fresh ones.
     """
     return (
         metric_record_day(record) == day

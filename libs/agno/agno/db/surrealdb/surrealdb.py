@@ -1583,9 +1583,8 @@ class SurrealDb(BaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # A date with no sessions contributes no records, and the sweep
-                # inside ``bulk_upsert_metrics`` only reaches the dates it is
-                # given records for: clear its leftover records below instead.
+                # The sweep in ``bulk_upsert_metrics`` only reaches dates it is given records for,
+                # so a date with none is cleared below instead
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
                     dates_without_sessions.append(date_to_process)
                     continue
@@ -1597,8 +1596,8 @@ class SurrealDb(BaseDb):
             if metrics_records:
                 results = bulk_upsert_metrics(self.client, table, metrics_records)
 
-            # A date churned to zero sessions still holds records from a previous pass.
-            # Dates are stored surrealized, so match the midnight-UTC datetime.
+            # Drop the previous pass' records. Dates are stored surrealized, so match the
+            # midnight-UTC datetime
             for date_without_sessions in dates_without_sessions:
                 self._query(
                     f"DELETE {table} WHERE date = $date AND aggregation_period = $period",

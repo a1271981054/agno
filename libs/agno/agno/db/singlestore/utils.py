@@ -154,17 +154,11 @@ def is_valid_table(db_engine: Engine, table_name: str, table_type: str, db_schem
 
 
 # -- Metrics util methods --
-# Per-user aggregation: the bucket key is (user_id, date, aggregation_period), enforced
-# by ``bulk_upsert_metrics`` rather than a UNIQUE index — see ``schemas.py``.
-# Unowned sessions aggregate under the sentinel empty-string user_id.
 def _superseded_metrics_delete(table: Table, metrics_records: list[dict]):
     """Build the DELETE clearing the buckets the given records supersede.
 
-    An owner still holding a (date, aggregation_period) pair this recalculation
-    wrote has no sessions left on that date, and its stale row would be summed on
-    top of the fresh ones. Where MySQL's sweep spares the owners being rewritten,
-    this clears EVERY row for those pairs: SingleStore has no unique key on metrics,
-    so a repeated calculation can already have left several rows per bucket.
+    Clears EVERY row for the pairs being rewritten, not just the superseded owners: SingleStore has no
+    unique key on metrics, so a repeated calculation can already have left several rows per bucket.
 
     Args:
         table (Table): The metrics table.
@@ -191,12 +185,8 @@ def _superseded_metrics_pairs(table: Table, metrics_records: list[dict]):
 def _existing_metrics_identity(session: Session, table: Table, metrics_records: list[dict]) -> Dict[tuple, tuple]:
     """Each bucket's current id and created_at, keyed by (user_id, date, period).
 
-    The delete clears whole pairs, so every record is written fresh afterwards
-    and would otherwise take a new ``uuid4`` id and a new ``created_at`` on every
-    refresh: a client polling /metrics would watch the id change under it, and
-    created_at would stop meaning when the bucket was first written. SingleStore
-    has no unique key to stop a bucket holding several rows, so the earliest
-    created_at wins and its id comes with it.
+    The delete clears whole pairs, so without this a bucket would take a new id and created_at on
+    every refresh. A bucket can hold several rows, so the earliest created_at wins and its id with it.
     """
     rows = session.execute(
         select(table.c.user_id, table.c.date, table.c.aggregation_period, table.c.id, table.c.created_at).where(
@@ -216,12 +206,8 @@ def _existing_metrics_identity(session: Session, table: Table, metrics_records: 
 def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[dict]) -> list[dict]:
     """Bulk upsert metrics into the database with proper duplicate handling.
 
-    SingleStore has no unique key on (user_id, date, aggregation_period), so
-    there is no conflict target to upsert against: the buckets being rewritten
-    are cleared and written fresh instead. Each one keeps the id and created_at
-    it already had, so only the numbers move. The id PRIMARY KEY is the one
-    conflict a concurrent refresh can still hit — both refreshes carry the same
-    stored id — and that collision updates in place instead of raising.
+    No unique key on (user_id, date, aggregation_period) to upsert against, so the buckets being
+    rewritten are cleared and written fresh, each keeping the id and created_at it already had.
 
     Args:
         table (Table): The table to upsert into.
@@ -235,7 +221,6 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
 
     carried = _existing_metrics_identity(session, table, metrics_records)
 
-    # Clears every row for the (date, aggregation_period) pairs being rewritten.
     # Committed together with the writes below, so a crash can't leave a date with no metrics.
     session.execute(_superseded_metrics_delete(table, metrics_records))
 
@@ -246,8 +231,7 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
         if existing_identity is not None:
             record = {**record, "id": existing_identity[0], "created_at": existing_identity[1]}
 
-        # An overlapping refresh can land between our delete and this write, so a plain
-        # INSERT would crash on the id PRIMARY KEY. Update in place on conflict instead.
+        # An overlapping refresh landing between our delete and this write collides on the id PRIMARY KEY.
         stmt = mysql.insert(table).values(**record)
         stmt = stmt.on_duplicate_key_update(
             **{

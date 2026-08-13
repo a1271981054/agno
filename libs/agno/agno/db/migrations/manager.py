@@ -97,12 +97,8 @@ class MigrationManager:
             # Find files after the current version
             latest_version = None
             for version, normalised_version in self.available_versions:
-                # force also re-runs the version the table already carries, so a table
-                # stamped for a migration that never actually ran can be recovered.
-                # The SQL migrations check for their own work before doing it, so a
-                # re-run is a no-op. Versions without a module are skipped: 2.0.0 is the
-                # baseline every SQL adapter reports for an unstamped table, and there is
-                # nothing to migrate it to itself.
+                # force also re-runs the version already stamped, which the SQL migrations no-op on.
+                # Versions with no module are skipped: 2.0.0 is the baseline for an unstamped table
                 forced_rerun = (
                     force
                     and normalised_version == current_version
@@ -114,9 +110,7 @@ class MigrationManager:
 
                     log_info(f"Applying migration {normalised_version} on {table_name}")
                     migration_executed = await self._up_migration(version, table_type, table_name)
-                    # Only a migration that reports it did work moves the stamp. Stamping
-                    # on a no-op would mark absent or unhandled tables as migrated, and a
-                    # later run of the migration that does handle them would be skipped.
+                    # Only a migration that did work moves the stamp, or an unhandled table reads as migrated
                     if migration_executed:
                         latest_version = normalised_version.public
                         log_info(f"Successfully applied migration {normalised_version} on table {table_name}")

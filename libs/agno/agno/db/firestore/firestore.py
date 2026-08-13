@@ -1771,10 +1771,8 @@ class FirestoreDb(BaseDb):
         """Get all sessions of all types for metrics calculation."""
         try:
             collection_ref = self._get_collection(table_type="sessions")
-            # create_collection_if_not_found=False returns None whenever this instance
-            # has not initialized the runs handle, not only when the collection is
-            # missing: a fresh replica would count zero runs and overwrite the run
-            # counts and model metrics with zeros
+            # create_collection_if_not_found=False also returns None when this instance simply hasn't
+            # initialized the runs handle, so a fresh replica would zero out run counts and model metrics.
             runs_collection_ref = self._get_collection(table_type="runs", create_collection_if_not_found=True)
 
             query = collection_ref
@@ -1901,9 +1899,7 @@ class FirestoreDb(BaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # A date with no sessions contributes no records, and the sweep
-                # inside ``bulk_upsert_metrics`` only reaches the dates it is
-                # given records for: clear its leftover documents below instead.
+                # The sweep in ``bulk_upsert_metrics`` only reaches dates it is given records for.
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
                     dates_without_sessions.append(date_key)
                     continue

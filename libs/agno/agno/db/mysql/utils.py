@@ -130,15 +130,11 @@ def is_valid_table(db_engine: Engine, table_name: str, table_type: str, db_schem
 
 
 # -- Metrics util methods --
-# Per-user aggregation: unique key is (user_id, date, aggregation_period).
-# Unowned sessions aggregate under the sentinel empty-string user_id.
 def _superseded_metrics_filter(table: Table, metrics_records: list[dict]):
     """Build the filter matching the buckets the given records supersede.
 
-    An owner still holding a (date, aggregation_period) pair this recalculation
-    wrote has no sessions left on that date, and the unscoped /metrics aggregate
-    would sum its stale row on top of the fresh ones. Pairs that produced no
-    records are left alone.
+    An owner left holding a rewritten (date, aggregation_period) pair has no sessions on that
+    date anymore, and the unscoped /metrics aggregate would sum its stale row on top.
 
     Args:
         table (Table): The metrics table.
@@ -156,9 +152,7 @@ def _superseded_metrics_filter(table: Table, metrics_records: list[dict]):
             and_(
                 table.c.date == date_to_process,
                 table.c.aggregation_period == aggregation_period,
-                # NOT IN is three-valued, so a NULL owner would evade it. The
-                # column is NOT NULL on a migrated or fresh table; this is for
-                # the hand-patched ones.
+                # NOT IN is three-valued: a NULL owner would evade it. Only hand-patched tables have one.
                 or_(table.c.user_id.is_(None), table.c.user_id.notin_(owners)),
             )
             for (date_to_process, aggregation_period), owners in owners_per_pair.items()
@@ -182,18 +176,15 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
 
     results = []
 
-    # Upsert in unique-key order. Concurrent recalculations that lock the same
-    # rows in different orders deadlock on the unique index; with a shared order
-    # the loser just blocks on the first contended row instead.
+    # Upsert in unique-key order: concurrent recalculations that lock the same rows in a
+    # different order deadlock on the unique index.
     metrics_records = sorted(
         metrics_records,
         key=lambda record: (record["user_id"] or "", str(record["date"]), record["aggregation_period"]),
     )
 
-    # Same transaction as the upserts below, so a crash can't leave a date with no
-    # metrics. Deletes by primary key: a ranged DELETE next-key locks the whole date
-    # range it scans, the rows it spares included, and deadlocks against a concurrent
-    # recalculation's upserts. With the ordering above, two of them no longer do.
+    # Same transaction as the upserts below, so a crash can't leave a date with no metrics.
+    # Delete by primary key: a ranged DELETE next-key locks rows it spares and deadlocks against concurrent upserts.
     stale_ids_stmt = select(table.c.id).where(_superseded_metrics_filter(table, metrics_records))
     stale_ids = sorted(row[0] for row in session.execute(stale_ids_stmt))
     if stale_ids:
@@ -248,18 +239,15 @@ async def abulk_upsert_metrics(session: AsyncSession, table: Table, metrics_reco
 
     results = []
 
-    # Upsert in unique-key order. Concurrent recalculations that lock the same
-    # rows in different orders deadlock on the unique index; with a shared order
-    # the loser just blocks on the first contended row instead.
+    # Upsert in unique-key order: concurrent recalculations that lock the same rows in a
+    # different order deadlock on the unique index.
     metrics_records = sorted(
         metrics_records,
         key=lambda record: (record["user_id"] or "", str(record["date"]), record["aggregation_period"]),
     )
 
-    # Same transaction as the upserts below, so a crash can't leave a date with no
-    # metrics. Deletes by primary key: a ranged DELETE next-key locks the whole date
-    # range it scans, the rows it spares included, and deadlocks against a concurrent
-    # recalculation's upserts. With the ordering above, two of them no longer do.
+    # Same transaction as the upserts below, so a crash can't leave a date with no metrics.
+    # Delete by primary key: a ranged DELETE next-key locks rows it spares and deadlocks against concurrent upserts.
     stale_ids_stmt = select(table.c.id).where(_superseded_metrics_filter(table, metrics_records))
     stale_ids = sorted(row[0] for row in (await session.execute(stale_ids_stmt)))
     if stale_ids:

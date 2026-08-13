@@ -1,4 +1,4 @@
-"""Tests for the v3.0.0 evals user_id migration: column add, idempotency, revert."""
+"""Tests for the v3.0.0 user_id migration: column add, idempotency, revert."""
 
 from __future__ import annotations
 
@@ -236,12 +236,7 @@ def test_table_type_the_backend_does_not_have_is_skipped(monkeypatch):
 
 
 def test_a_noop_migration_does_not_move_the_version_stamp(monkeypatch):
-    """A migration that did no work must not stamp the table.
-
-    Stamping on a no-op marks a table a later migration DOES handle as already
-    migrated, and that migration is then skipped. This is exactly how a metrics
-    table migrated before the metrics handler existed would be stranded.
-    """
+    """Stamping on a no-op would strand a table a later migration does handle."""
     from agno.db.migrations.versions import v3_0_0
 
     db, db_file = _new_db()
@@ -506,8 +501,7 @@ def _legacy_metrics_ddl(db, schemas, table: str) -> list[str]:
 
 
 def _legacy_metrics_insert(table: str) -> str:
-    """The INSERT a pre-v3 install ran: no user_id to fill, and a uuid for an id,
-    which is what a metrics id has always been."""
+    """The INSERT a pre-v3 install ran: no user_id to fill, and a uuid for an id."""
     return (
         f"INSERT INTO {table} (id, agent_runs_count, team_runs_count, workflow_runs_count, agent_sessions_count, "
         "team_sessions_count, workflow_sessions_count, users_count, token_metrics, model_metrics, date, "
@@ -539,13 +533,9 @@ def _metrics_record(user_id: str, day: date = UNFINISHED_DAY) -> dict:
 
 
 def _upsert_metrics(db, records: list[dict]) -> None:
-    """Write metrics the way the adapter writes them.
-
-    ``bulk_upsert_metrics`` is what ``calculate_metrics`` calls, and its upsert
-    names (user_id, date, aggregation_period) as the conflict target, so it only
-    lands against the v3.0 unique key. A raw INSERT touches no unique key at all
-    and would pass just the same against a table the migration had left alone.
-    """
+    """Write metrics the way ``calculate_metrics`` does: the upsert names
+    (user_id, date, aggregation_period) as its conflict target, so it only lands
+    against the v3.0 unique key where a raw INSERT would pass either way."""
     db_type = type(db).__name__
     if db_type == "PostgresDb":
         from agno.db.postgres.utils import bulk_upsert_metrics
@@ -569,9 +559,7 @@ async def _async_upsert_metrics(db, records: list[dict]) -> None:
 
 
 def _new_legacy_metrics_db():
-    """A metrics table exactly as v2.5.6 created it: no user_id, unique on
-    (date, aggregation_period), an index on date and one on aggregation_period,
-    and one finished day in it."""
+    """A v2.5.6 metrics table with one finished day in it."""
     from agno.db.sqlite import schemas
 
     db_file = os.path.join(tempfile.mkdtemp(), "test.db")
@@ -595,8 +583,7 @@ def _new_legacy_metrics_db():
 
 
 def _new_lookalike_metrics_db():
-    """A table of an operator's own that happens to carry date and
-    aggregation_period columns, wired up as the metrics table by mistake."""
+    """An operator's own table, wired up as the metrics table by mistake."""
     db_file = os.path.join(tempfile.mkdtemp(), "test.db")
     db = SqliteDb(db_file=db_file, metrics_table=LOOKALIKE_TABLE)
     db._get_table(table_type="versions", create_table_if_not_found=True)
@@ -619,8 +606,7 @@ def _new_lookalike_metrics_db():
 
 
 def _new_hand_patched_metrics_db():
-    """A v3.0 metrics table whose user_id an operator added themselves: the right
-    unique key, but a column that takes NULL, and a row with no owner recorded."""
+    """A v3.0 metrics table whose user_id an operator added themselves: it takes NULL."""
     _, fresh_file = _new_db_with(["metrics"])
     nullable_ddl = _table_ddl(fresh_file, METRICS_TABLE).replace("user_id VARCHAR NOT NULL", "user_id VARCHAR")
     assert "user_id VARCHAR NOT NULL" not in nullable_ddl
@@ -675,8 +661,7 @@ def _table_names(db_file: str) -> set[str]:
 
 
 def _metrics_rows(db_file: str) -> list:
-    """Every metrics row as (date, agent_runs_count). The ids are uuids, so the
-    payload is what says a row came through a rebuild intact."""
+    """Every metrics row as (date, agent_runs_count)."""
     conn = sqlite3.connect(db_file)
     try:
         return conn.execute(f"SELECT date, agent_runs_count FROM {METRICS_TABLE} ORDER BY date").fetchall()
@@ -723,16 +708,14 @@ def test_metrics_migration_keeps_rows_and_other_indexes():
     asyncio.run(MigrationManager(db).up(table_type="metrics"))
 
     assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
-    # the rebuild replaces the table, so both of the indexes v2.5.6 declared have
-    # to come back with it
+    # both of the indexes v2.5.6 declared come back with the rebuilt table
     assert {METRICS_DATE_INDEX, METRICS_PERIOD_INDEX} <= _table_indexes(db_file, METRICS_TABLE)
-    # nothing left behind from the rebuild
     assert METRICS_BACKUP_TABLE not in _table_names(db_file)
 
 
 def test_metrics_migrated_rows_land_in_the_unowned_bucket():
-    """Rows written before ownership existed get "", not NULL: a unique key
-    containing user_id would treat every NULL as distinct."""
+    """Rows written before ownership existed get "", not NULL: a unique key containing
+    user_id would treat every NULL as distinct."""
     db, db_file = _new_legacy_metrics_db()
 
     asyncio.run(MigrationManager(db).up(table_type="metrics"))
@@ -743,10 +726,8 @@ def test_metrics_migrated_rows_land_in_the_unowned_bucket():
 
 
 def test_metrics_migration_drops_unfinished_days_and_keeps_finished_ones():
-    """The row for the day the upgrade lands on holds that day's traffic for every
-    user. Stamped unowned it becomes a bucket the per-user recalculation never
-    rewrites, so the day is counted once per user and once again in the leftover.
-    Finished days are frozen and stay exactly as they are."""
+    """The day the upgrade lands on holds every user's traffic in one row, so stamped
+    unowned it would be counted twice. Finished days are frozen and stay as they are."""
     db, db_file = _new_legacy_metrics_db()
     _insert_legacy_metrics_row(db_file, UNFINISHED_DAY, completed=False)
 
@@ -754,8 +735,7 @@ def test_metrics_migration_drops_unfinished_days_and_keeps_finished_ones():
 
     assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
 
-    # only the run that adds the column may delete: a live per-user bucket for a
-    # day still in progress has to survive every later one
+    # only the run that adds the column may delete, so a live per-user bucket survives
     _upsert_metrics(db, [_metrics_record("alice")])
     asyncio.run(MigrationManager(db).up(table_type="metrics", force=True))
 
@@ -792,8 +772,7 @@ def test_metrics_migration_is_idempotent():
 
 
 def test_metrics_rebuild_carries_operator_columns_and_indexes():
-    """The rebuild replaces the table, so a column and an index the schema knows
-    nothing about are only still there afterwards if it carries them over."""
+    """The rebuild replaces the table, so it has to carry over what the schema does not know about."""
     db, db_file = _new_legacy_metrics_db()
     _run_sqlite(
         db_file,
@@ -819,14 +798,13 @@ def test_metrics_rebuild_carries_operator_columns_and_indexes():
 
 
 def test_metrics_interrupted_rebuild_leaves_the_table_untouched():
-    """The rebuild is one transaction. A statement failing part way through has to
-    leave the table, its rows and its indexes exactly as they were — and a second
-    run, once the obstacle is gone, has to migrate cleanly."""
+    """The rebuild is one transaction: a statement failing part way through leaves the
+    table as it was, and a second run once the obstacle is gone migrates cleanly."""
     db, db_file = _new_legacy_metrics_db()
     before_ddl = _table_ddl(db_file, METRICS_TABLE)
     before_indexes = _table_indexes(db_file, METRICS_TABLE)
-    # index names are database-wide in SQLite, so one left on another table under
-    # a name the rebuild needs fails it after the table has been renamed aside
+    # index names are database-wide in SQLite, so one squatting on a name the
+    # rebuild needs fails it after the table has been renamed aside
     _run_sqlite(
         db_file,
         "CREATE TABLE leftover (user_id VARCHAR)",
@@ -850,8 +828,7 @@ def test_metrics_interrupted_rebuild_leaves_the_table_untouched():
 
 
 def test_metrics_rebuild_refuses_a_lookalike_table():
-    """The rebuild replaces the table, so a metrics_table pointing at something
-    else has to be refused rather than acted on."""
+    """The rebuild replaces the table, so a metrics_table pointing elsewhere is refused."""
     db, db_file = _new_lookalike_metrics_db()
     before_ddl = _table_ddl(db_file, LOOKALIKE_TABLE)
 
@@ -880,8 +857,7 @@ def test_metrics_revert_refuses_while_rows_are_owned():
 
 
 def test_metrics_revert_refuses_when_an_owner_is_null():
-    """The column is declared NOT NULL, so a NULL owner means something outside the
-    migration has been at the table — and it is still not the unowned bucket."""
+    """The column is NOT NULL, so a NULL owner is not the unowned bucket."""
     db, db_file = _new_hand_patched_metrics_db()
 
     asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="metrics"))
@@ -977,8 +953,8 @@ LIVE_DB_PARAMS = [
 
 
 def _new_live_metrics_db(kind: str):
-    """A live metrics table exactly as v2.5.6 created it, under a name of its own
-    so a shared server can run this suite more than once at a time."""
+    """A v2.5.6 metrics table under a name of its own, so a shared server can run
+    this suite more than once at a time."""
     table = f"metrics_v3_{uuid4().hex[:8]}"
     if kind == "postgres":
         from agno.db.postgres import PostgresDb, schemas
@@ -1010,8 +986,8 @@ def _drop_live_metrics_db(db) -> None:
 
 
 def _async_live_twin(db):
-    """The async adapter for the table the sync one just built. The async half of
-    the migration carries its own copy of every statement, so it needs its own run."""
+    """The async adapter for the table the sync one just built: the async half of the
+    migration carries its own copy of every statement."""
     if type(db).__name__ == "PostgresDb":
         pytest.importorskip("psycopg")
         from agno.db.postgres import AsyncPostgresDb
@@ -1080,8 +1056,7 @@ def _live_indexes(db) -> set[str]:
 
 
 def _live_metrics_rows(db) -> list:
-    """Every metrics row as (date, agent_runs_count). The ids are uuids, so the
-    payload is what says a row came through the migration intact."""
+    """Every metrics row as (date, agent_runs_count)."""
     with db.Session() as sess:
         rows = sess.execute(
             text(f"SELECT date, agent_runs_count FROM {db.db_schema}.{db.metrics_table_name} ORDER BY date")
@@ -1120,9 +1095,8 @@ def test_live_metrics_migration_swaps_the_unique_key(live_metrics_db):
 
 
 def test_live_metrics_migration_stamps_rows_and_drops_unfinished_days(live_metrics_db):
-    """Finished days are frozen and carry over into the unowned bucket. The day the
-    upgrade lands on holds every user's traffic in one row, so it goes and is
-    recalculated per owner."""
+    """Finished days carry over into the unowned bucket; the day the upgrade lands on
+    goes, to be recalculated per owner."""
     db = live_metrics_db
     _insert_live_metrics_row(db, UNFINISHED_DAY, completed=False)
 
@@ -1131,8 +1105,7 @@ def test_live_metrics_migration_stamps_rows_and_drops_unfinished_days(live_metri
     assert _live_metrics_rows(db) == [(FINISHED_DAY, 7)]
     assert _live_metrics_owners(db) == [""]
 
-    # only the run that adds the column may delete: a live per-user bucket for a
-    # day still in progress has to survive every later one
+    # only the run that adds the column may delete, so a live per-user bucket survives
     _upsert_metrics(db, [_metrics_record("alice")])
     asyncio.run(MigrationManager(db).up(table_type="metrics", force=True))
 
@@ -1150,8 +1123,8 @@ def test_live_metrics_two_owners_can_share_a_date_after_the_migration(live_metri
 
 
 def test_live_metrics_case_distinct_owners_keep_separate_buckets(live_metrics_db):
-    """user_id is bin-collated on MySQL: a case-insensitive key would fold
-    ``alice`` and ``ALICE`` into one row and hand each the other's bucket."""
+    """user_id is bin-collated on MySQL: a case-insensitive key would fold ``alice``
+    and ``ALICE`` into one row and hand each the other's bucket."""
     db = live_metrics_db
     asyncio.run(MigrationManager(db).up(table_type="metrics"))
 

@@ -1145,8 +1145,7 @@ class GcsJsonDb(BaseDb):
                     for existing_metric in metrics
                     if not is_superseded_metrics_record(existing_metric, date_to_process, owners)
                 ]
-                # A date can sweep without producing fresh records, contributing nothing
-                # to ``results`` — the blob still has to be written.
+                # A sweep with no fresh records adds nothing to ``results``, but still has to be written
                 if len(metrics) != size_before_sweep:
                     swept_stale_record = True
 

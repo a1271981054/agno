@@ -1689,12 +1689,10 @@ class DynamoDb(BaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # One record per user_id. An empty date yields none — the
-                # sweep inside the bulk upsert clears its buckets.
+                # One record per user_id. An empty date yields none — the sweep below clears its buckets.
                 metrics_records.extend(calculate_date_metrics(date_to_process, sessions_for_date))
 
-            # Store metrics in DynamoDB. Runs even with no records to store:
-            # the superseded sweep covers every date in the window.
+            # Runs even with no records to store: the sweep covers every date in the window
             results = self._bulk_upsert_metrics(metrics_records, dates_to_process)
 
             log_debug("Updated metrics calculations")
@@ -1885,9 +1883,8 @@ class DynamoDb(BaseDb):
                 if upserted_record:
                     results.append(upserted_record)
 
-            # Clear what this recalculation supersedes. No transaction here, so this
-            # runs after the fresh set is in place — a crash between the two leaves a
-            # stale record only a later window covering that date can sweep.
+            # No transaction here, so the sweep runs after the fresh set is in place: a crash between
+            # the two leaves a stale record only a later window covering that date can sweep
             self._delete_superseded_metrics_records(table_name, metrics_records, dates_to_process)
 
             return results
@@ -1901,18 +1898,10 @@ class DynamoDb(BaseDb):
     ) -> None:
         """Delete the metrics records the given recalculation supersedes.
 
-        An owner still holding a (date, aggregation_period) bucket this recalculation
-        wrote has no sessions left on that date, and its stale record would be summed
-        on top of the fresh ones, the pre-user_id ``uuid4``-id record included. Every
-        date in the window sweeps, sessions or not: a date churned to zero sessions
-        produces no fresh records, and each bucket it still holds is stale.
-
-        Reads the ``date-aggregation_period-index`` GSI, one Query per pair instead
-        of a whole-table scan. The GSI is eventually consistent, but a stale view is
-        harmless here: a fresh record's id encodes its (date, user_id), so the index
-        can only still list an id this pass just rewrote — excluded via
-        ``written_ids`` — or one already deleted, and deleting again is a no-op. A
-        record the index does not list yet is simply left for the next recalculation.
+        An owner still holding a bucket the recalculation no longer wrote has no sessions left on
+        that date, and its stale record would be summed on top of the fresh ones. Queries the
+        ``date-aggregation_period-index`` GSI per (date, period) pair instead of scanning the whole
+        table, excluding the ids this pass rewrote.
 
         Args:
             table_name: The DynamoDB metrics table name

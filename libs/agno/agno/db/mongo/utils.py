@@ -20,13 +20,11 @@ if TYPE_CHECKING:
     from agno.db.mongo.async_mongo import AsyncMongoCollectionType
 
 
-# The pre-user_id metrics unique key. ``create_index`` never removes it, so on an
-# upgraded deployment it rejects every per-user bucket after the first until the
-# drop below.
+# The pre-user_id metrics unique key. ``create_index`` never removes it, and it rejects
+# every per-user bucket after the first until the drop below.
 OBSOLETE_METRICS_INDEX = "date_1_aggregation_period_1"
 
-# MongoDB's IndexNotFound. Replicas booting together all see the obsolete index
-# and all try to drop it; whoever loses the race gets this and has nothing to do.
+# MongoDB's IndexNotFound, raised by whichever replica loses the race to drop the index.
 INDEX_NOT_FOUND = 27
 
 
@@ -239,10 +237,9 @@ def get_dates_to_calculate_metrics_for(starting_date: date) -> list[date]:
 def _superseded_metrics_filter(metrics_records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Build the filter matching the buckets the given records supersede.
 
-    An owner still holding a (date, aggregation_period) pair this recalculation
-    wrote has no sessions left on that date, and its stale document would be
-    summed on top of the fresh ones. ``$nin`` also matches the pre-user_id
-    document, which carries no ``user_id`` field at all.
+    An owner left over on a pair this recalculation wrote has no sessions on that date, and its stale
+    document would be summed on top of the fresh ones. ``$nin`` also matches the pre-user_id document,
+    which carries no ``user_id`` field at all.
 
     Args:
         metrics_records (List[Dict[str, Any]]): The freshly calculated metrics records.
@@ -255,7 +252,7 @@ def _superseded_metrics_filter(metrics_records: List[Dict[str, Any]]) -> Dict[st
         record_date = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
         owners_per_pair.setdefault((record_date, record["aggregation_period"]), set()).add(record.get("user_id", ""))
 
-    # ``key=str`` keeps the sort total: nothing coerces user_id, and one non-str owner would make a bare sort raise.
+    # ``key=str``: nothing coerces user_id, and a mixed-type owner set would make a bare sort raise
     return {
         "$or": [
             {
@@ -285,16 +282,14 @@ def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, 
     for record in metrics_records:
         record["date"] = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
         try:
-            # The unique key is (user_id, date, aggregation_period). Legacy records
-            # default to the empty-string sentinel so they still match a single bucket.
+            # The unique key is (user_id, date, aggregation_period); legacy records use the empty-string sentinel.
             key_filter = {
                 "user_id": record.get("user_id", ""),
                 "date": record["date"],
                 "aggregation_period": record["aggregation_period"],
             }
 
-            # ``replace_one`` swaps the whole document, so carry over id and
-            # created_at from the replaced document, like the SQL adapters' ON CONFLICT.
+            # ``replace_one`` swaps the whole document, so carry id and created_at over like the SQL ON CONFLICT.
             existing = collection.find_one(key_filter, {"id": 1, "created_at": 1})
             if existing is not None:
                 record["id"] = existing.get("id", record["id"])
@@ -307,10 +302,8 @@ def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, 
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
 
-    # Clear what this recalculation supersedes. No transaction here, so this runs
-    # after the fresh set is in place: a crash leaves a stale bucket over the day's
-    # total, never a date with no metrics. Only a later window covering that date
-    # can sweep it, and a completed day is not revisited.
+    # Clear what this recalculation supersedes. Without a transaction this runs after the fresh set is in
+    # place, so a crash leaves a stale bucket over the day's total rather than a date with no metrics.
     collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results
@@ -335,16 +328,14 @@ async def abulk_upsert_metrics(
     for record in metrics_records:
         record["date"] = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
         try:
-            # The unique key is (user_id, date, aggregation_period). Legacy records
-            # default to the empty-string sentinel so they still match a single bucket.
+            # The unique key is (user_id, date, aggregation_period); legacy records use the empty-string sentinel.
             key_filter = {
                 "user_id": record.get("user_id", ""),
                 "date": record["date"],
                 "aggregation_period": record["aggregation_period"],
             }
 
-            # ``replace_one`` swaps the whole document, so carry over id and
-            # created_at from the replaced document, like the SQL adapters' ON CONFLICT.
+            # ``replace_one`` swaps the whole document, so carry id and created_at over like the SQL ON CONFLICT.
             existing = await collection.find_one(key_filter, {"id": 1, "created_at": 1})
             if existing is not None:
                 record["id"] = existing.get("id", record["id"])
@@ -357,10 +348,8 @@ async def abulk_upsert_metrics(
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
 
-    # Clear what this recalculation supersedes. No transaction here, so this runs
-    # after the fresh set is in place: a crash leaves a stale bucket over the day's
-    # total, never a date with no metrics. Only a later window covering that date
-    # can sweep it, and a completed day is not revisited.
+    # Clear what this recalculation supersedes. Without a transaction this runs after the fresh set is in
+    # place, so a crash leaves a stale bucket over the day's total rather than a date with no metrics.
     await collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results

@@ -2206,9 +2206,7 @@ class AsyncMongoDb(AsyncBaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # A date with no sessions contributes no records, and the sweep
-                # inside ``abulk_upsert_metrics`` only reaches the dates it is
-                # given records for: clear its leftover buckets below instead.
+                # The sweep in ``abulk_upsert_metrics`` only reaches dates it is given records for.
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
                     dates_without_sessions.append(date_key)
                     continue

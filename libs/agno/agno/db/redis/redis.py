@@ -1504,7 +1504,7 @@ class RedisDb(BaseDb):
                 date_records = calculate_date_metrics(date_to_process, sessions_for_date)
 
                 for metrics_record in date_records:
-                    # Preserve created_at across re-runs.
+                    # Update the existing record while preserving created_at
                     existing_record = self._get_record("metrics", metrics_record["id"])
                     if existing_record:
                         metrics_record["created_at"] = existing_record.get("created_at", metrics_record["created_at"])

@@ -331,9 +331,8 @@ def get_dates_to_calculate_metrics_for(starting_date: date) -> list[date]:
 def _superseded_metrics_docs(collection_ref, metrics_records: List[Dict[str, Any]]) -> List[Any]:
     """Return the document references for the buckets the given records supersede.
 
-    An owner still holding a (date, aggregation_period) pair this recalculation
-    wrote has no sessions left on that date, and its stale document would be
-    summed on top of the fresh ones, the pre-user_id ``{date}_daily`` doc included.
+    An owner left over on a pair this recalculation wrote has no sessions on that date, and its stale
+    document would be summed on top of the fresh ones, the pre-user_id ``{date}_daily`` doc included.
 
     Args:
         collection_ref: The Firestore metrics collection reference.
@@ -349,9 +348,7 @@ def _superseded_metrics_docs(collection_ref, metrics_records: List[Dict[str, Any
 
     doc_refs = []
     for (record_date, aggregation_period), owners in owners_per_pair.items():
-        # Filtered on ``date`` alone, a single-field index every deployment has.
-        # ``not-in`` can't carry the rest: it caps at 10 values and skips documents
-        # with no ``user_id`` field, i.e. the pre-user_id doc.
+        # ``date`` alone uses a single-field index; ``not-in`` caps at 10 values and skips docs with no ``user_id``.
         for doc in collection_ref.where(filter=FieldFilter("date", "==", record_date)).stream():
             data = doc.to_dict() or {}
             if data.get("aggregation_period") == aggregation_period and data.get("user_id") not in owners:
@@ -376,16 +373,14 @@ def bulk_upsert_metrics(collection_ref, metrics_records: List[Dict[str, Any]]) -
     results = []
     batch = collection_ref._client.batch()
 
-    # Clear what this recalculation supersedes in the same batch as the writes,
-    # so a failed commit can't leave a date with no metrics. Across a chunk
-    # boundary that no longer holds; Firestore has no wider unit of atomicity.
+    # Clear what this recalculation supersedes in the same batch as the writes, so a failed commit can't
+    # leave a date with no metrics. Across a chunk boundary it can: Firestore has no wider unit of atomicity.
     staged = 0
     for doc_ref in _superseded_metrics_docs(collection_ref, metrics_records):
         batch.delete(doc_ref)
         staged += 1
 
-        # Firestore caps a commit request at 10 MiB rather than an operation count;
-        # 500 is the conservative proxy the old per-batch limit used.
+        # Firestore caps a commit at 10 MiB, not an operation count; 500 is the proxy the old limit used.
         if staged % 500 == 0:
             batch.commit()
             batch = collection_ref._client.batch()
@@ -404,14 +399,12 @@ def bulk_upsert_metrics(collection_ref, metrics_records: List[Dict[str, Any]]) -
             log_error(f"Error preparing metrics record for batch: {str(e)}")
             continue
 
-        # Committed outside the try/except: a failed commit is not a bad record,
-        # and swallowing it would report success for writes that never landed.
+        # Committed outside the try/except: swallowing a failed commit would report writes that never landed.
         if staged % 500 == 0:
             batch.commit()
             batch = collection_ref._client.batch()
 
-    # Commit remaining operations. A failure propagates, matching how the SQL
-    # adapters surface an upsert that did not land.
+    # Commit remaining operations. A failure propagates, like the SQL adapters' upserts.
     if staged % 500 != 0:
         batch.commit()
 

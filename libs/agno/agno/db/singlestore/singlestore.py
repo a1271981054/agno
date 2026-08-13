@@ -2060,8 +2060,7 @@ class SingleStoreDb(BaseDb):
             Optional[date]: The starting date for which metrics calculation is needed.
         """
         with self.Session() as sess:
-            # Incomplete first on tied dates, so a day with per-user rows still
-            # needing recalculation is not skipped over
+            # Incomplete first on tied dates, so a day still needing per-user recalculation is not skipped
             stmt = select(table).order_by(table.c.date.desc(), table.c.completed.asc()).limit(1)
             result = sess.execute(stmt).fetchone()
 
@@ -2132,9 +2131,7 @@ class SingleStoreDb(BaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # A date with no sessions contributes no records, and the sweep
-                # inside ``bulk_upsert_metrics`` only reaches the pairs it is
-                # handed records for: clear its leftover rows below instead.
+                # The sweep in ``bulk_upsert_metrics`` only reaches pairs it has records for, so clear these below
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
                     dates_without_sessions.append(date_to_process)
                     continue
@@ -2144,10 +2141,8 @@ class SingleStoreDb(BaseDb):
 
             if metrics_records or dates_without_sessions:
                 with self.Session() as sess, sess.begin():
-                    # A date churned to zero sessions still holds buckets from a previous
-                    # pass. Ranged DELETE, same shape as the sweep inside
-                    # ``bulk_upsert_metrics`` — SingleStore has no next-key locks to widen it.
-                    # Must run before the upsert: that commits internally and closes this block.
+                    # A date churned to zero sessions still holds buckets from a previous pass. Must run
+                    # before the upsert: ``bulk_upsert_metrics`` commits internally and closes this block.
                     if dates_without_sessions:
                         sess.execute(
                             table.delete().where(

@@ -125,9 +125,8 @@ def _delete_superseded_metrics(
 ) -> None:
     """Delete the metrics records the given recalculation supersedes.
 
-    An owner still holding a (date, aggregation_period) pair this recalculation
-    wrote has no sessions left on that date, and its stale record would be summed
-    on top of the fresh ones, the pre-user_id bare-date record included.
+    An owner still holding a bucket the recalculation no longer wrote has no sessions left on that
+    date, and its stale record would be summed on top of the fresh ones.
 
     Args:
         table (str): The metrics table.
@@ -138,6 +137,7 @@ def _delete_superseded_metrics(
         owners_per_pair.setdefault((metric["date"], metric["aggregation_period"]), set()).add(metric.get("user_id", ""))
 
     for (date_to_process, aggregation_period), owners in owners_per_pair.items():
+        # ``key=str``: nothing coerces user_id, and a bare sort over a mixed-type owner set raises
         utils.query(
             client,
             f"DELETE {table} WHERE date = $date AND aggregation_period = $period AND user_id NOT IN $owners",
@@ -170,8 +170,7 @@ def bulk_upsert_metrics(
 
     for metric in metrics_records:
         log_debug(f"Upserting metric: {metric}")
-        # Per-record: a mid-run failure must not report the records that
-        # already landed as unwritten, nor skip the sweep below.
+        # Per-record: a mid-run failure must not discard the records that already landed
         try:
             result = utils.query_one(
                 client,
@@ -186,9 +185,8 @@ def bulk_upsert_metrics(
         if result:
             results.append(result)
 
-    # Clear what this recalculation supersedes. SurrealDB gives no transaction here,
-    # so this runs after the fresh set is in place: a crash leaves a stale record
-    # over the day's total, never a date with no metrics.
+    # No transaction here, so the sweep runs after the fresh set is in place: a crash leaves a stale
+    # record over the day's total, never a date with no metrics
     try:
         _delete_superseded_metrics(client, table, metrics_records)
     except Exception as e:
