@@ -118,34 +118,6 @@ def get_metrics_calculation_starting_date(
         raise ValueError(f"Unexpected type for created_at: {type(first_session_date)}")
 
 
-def _delete_superseded_metrics(
-    client: Union[BlockingWsSurrealConnection, BlockingHttpSurrealConnection],
-    table: str,
-    metrics_records: List[Dict[str, Any]],
-) -> None:
-    """Delete the metrics records the given recalculation supersedes.
-
-    An owner still holding a bucket the recalculation no longer wrote has no sessions left on that
-    date, and its stale record would be summed on top of the fresh ones.
-
-    Args:
-        table (str): The metrics table.
-        metrics_records (List[Dict[str, Any]]): The freshly calculated, surrealized records.
-    """
-    owners_per_pair: Dict[tuple, set] = {}
-    for metric in metrics_records:
-        owners_per_pair.setdefault((metric["date"], metric["aggregation_period"]), set()).add(metric.get("user_id", ""))
-
-    for (date_to_process, aggregation_period), owners in owners_per_pair.items():
-        # ``key=str``: nothing coerces user_id, and a bare sort over a mixed-type owner set raises
-        utils.query(
-            client,
-            f"DELETE {table} WHERE date = $date AND aggregation_period = $period AND user_id NOT IN $owners",
-            {"date": date_to_process, "period": aggregation_period, "owners": sorted(owners, key=str)},
-            dict,
-        )
-
-
 def bulk_upsert_metrics(
     client: Union[BlockingWsSurrealConnection, BlockingHttpSurrealConnection],
     table: str,
@@ -184,13 +156,6 @@ def bulk_upsert_metrics(
 
         if result:
             results.append(result)
-
-    # No transaction here, so the sweep runs after the fresh set is in place: a crash leaves a stale
-    # record over the day's total, never a date with no metrics
-    try:
-        _delete_superseded_metrics(client, table, metrics_records)
-    except Exception as e:
-        log_error(f"Error clearing superseded metrics: {str(e)}")
 
     return results
 

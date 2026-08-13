@@ -354,18 +354,10 @@ seven SQL adapters (`PostgresDb`, `AsyncPostgresDb`, `SqliteDb`, `AsyncSqliteDb`
 `MySQLDb`, `AsyncMySQLDb`, `SingleStoreDb`) — they get the column, the key swap and the
 revert refusal. The other nine (`MongoDb`, `FirestoreDb`, `DynamoDb`, `SurrealDb`,
 `RedisDb`, `ValkeyDb`, `JsonDb`, `GcsJsonDb`, `InMemoryDb`) store a metrics record as a
-document and pick `user_id` up without a schema change — and they cannot run this
-migration at all: none of them keeps a per-table schema version, so `MigrationManager`
-logs `No version found for table agno_metrics` and moves on before dispatching. That is
-not specific to metrics; the sessions migration behaves the same way on those backends.
+document and pick `user_id` up without a schema change, so the migration has nothing to
+do on them and reports as much. New records are written per user from the first
+recalculation onwards.
 
-What repairs them instead is the recalculation. `calculate_metrics` is authoritative for
-every `(date, aggregation_period)` pair it writes records for: around the write it clears
-any *other* owner's record for those pairs. So the single pre-v3.0 record for the day of
-the upgrade is removed on the first refresh afterwards rather than being summed on top of
-the new per-user records for good, and an upgraded deployment converges on its own.
-Completed days from before the upgrade fall outside the recalculation window and stay as
-one unowned bucket per day — which is exactly what the SQL migration leaves behind too.
 MongoDB needed one thing more: its pre-v3.0 `date_1_aggregation_period_1` unique index
 would reject every per-user document after the first for a date, so the collection's
 index setup now drops it.

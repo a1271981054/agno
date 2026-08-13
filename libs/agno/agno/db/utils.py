@@ -3,7 +3,7 @@
 import json
 import time
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from uuid import UUID
 
 from agno.metrics import ModelMetrics, RunMetrics, SessionMetrics
@@ -485,18 +485,6 @@ def metric_record_day(record: Dict[str, Any]) -> Optional[date]:
     except (TypeError, ValueError):
         log_warning(f"Skipping metrics record {record.get('id')}: date {raw!r} is not a day")
         return None
-
-
-def is_superseded_metrics_record(record: Dict[str, Any], day: date, owners: Set[str]) -> bool:
-    """Whether a stored record is a daily bucket for ``day`` no longer owned by ``owners``.
-
-    Such a record is stale, and the unscoped metrics aggregate would sum it on top of the fresh ones.
-    """
-    return (
-        metric_record_day(record) == day
-        and record.get("aggregation_period") == "daily"
-        and record.get("user_id") not in owners
-    )
 
 
 def get_sort_value(record: Dict[str, Any], sort_by: str) -> Any:

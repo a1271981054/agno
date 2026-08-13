@@ -2375,16 +2375,23 @@ def _sqlite_metrics_ddl(db, table_name: str, with_user_id: bool) -> Optional[tup
 
 
 def _is_metrics_shaped(db, columns: List[str]) -> bool:
-    """Whether a table carries the metrics columns, so the rebuild may replace it.
+    """Whether a table is exactly the metrics table, so the rebuild may replace it.
 
-    The rebuild drops and recreates the table, so a mismatched (table_type, table_name)
-    pair has to be refused rather than acted on.
+    The rebuild drops and recreates the table from the adapter's schema, so a mismatched
+    (table_type, table_name) pair has to be refused rather than acted on, and so does a
+    column the schema does not declare: it would go with the table it was added to.
     """
     table_schema = _table_schema(db, "metrics")
     if table_schema is None:
         return False
     expected = {name for name in table_schema if not name.startswith("_") and name != "user_id"}
-    return expected.issubset(columns)
+    if not expected.issubset(columns):
+        return False
+    undeclared = sorted(set(columns) - expected - {"user_id"})
+    if undeclared:
+        log_warning(f"Refusing to rebuild metrics: the table carries columns the schema does not declare: {undeclared}")
+        return False
+    return True
 
 
 def _drop_incomplete_metrics_rows(sess, table_name: str, full_table: str) -> None:
@@ -2909,39 +2916,18 @@ async def _migrate_async_mysql_user_id(db: AsyncBaseDb, table_type: str, table_n
 
 
 def _sqlite_metrics_rebuild_plan(db, table_name: str, table_info: List[tuple], index_rows: List[tuple]) -> tuple:
-    """Work out what a rebuild has to carry over, as (carried, extra, extra_indexes).
+    """Work out what a rebuild has to carry over, as (carried, extra_indexes).
 
-    ``carried`` are the schema's own columns the live table has, ``extra`` the ones an
-    operator added, and ``extra_indexes`` the index statements the schema will not
-    recreate. All three are kept, since the rebuild would otherwise drop them.
+    ``carried`` are the schema's own columns the live table has, ``extra_indexes`` the
+    index statements the schema will not recreate; the rebuild would otherwise drop them.
     """
     table_schema = _table_schema(db, "metrics") or {}
     schema_columns = {name for name in table_schema if not name.startswith("_")}
     indexed = {f"idx_{table_name}_{name}" for name in schema_columns if table_schema[name].get("index")}
 
     carried = [col[1] for col in table_info if col[1] in schema_columns and col[1] != "user_id"]
-    extra = [col for col in table_info if col[1] not in schema_columns]
     extra_indexes = [row[1] for row in index_rows if row[0] not in indexed]
-    return carried, extra, extra_indexes
-
-
-def _sqlite_extra_column_ddl(quoted_table: str, extra: List[tuple]) -> List[str]:
-    """ADD COLUMN statements putting an operator's own metrics columns back.
-
-    A NOT NULL column is only reproduced as NOT NULL when it carries a default: SQLite
-    has no other way to fill it for the rows copied in.
-    """
-    statements = []
-    for column in extra:
-        name, column_type, notnull, default = column[1], column[2] or "TEXT", column[3], column[4]
-        clause = f"ALTER TABLE {quoted_table} ADD COLUMN {quote_db_identifier('SqliteDb', name)} {column_type}"
-        if default is not None:
-            clause += f" DEFAULT {default}"
-            if notnull:
-                clause += " NOT NULL"
-        log_info(f"-- Carrying over column {name} on {quoted_table}")
-        statements.append(clause)
-    return statements
+    return carried, extra_indexes
 
 
 def _migrate_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) -> bool:
@@ -2995,9 +2981,8 @@ def _migrate_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) 
             if row[0] not in unique_names or not set(_sqlite_index_columns(sess, row[0])) <= set(unique_columns)
         ]
 
-    carried, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
-    copied = carried + [col[1] for col in extra]
-    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in copied)
+    carried, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
     # Rows written before ownership existed belong to the unowned bucket
     owner_sql = "COALESCE(user_id, '')" if "user_id" in [col[1] for col in table_info] else "''"
 
@@ -3009,7 +2994,7 @@ def _migrate_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) 
             conn.exec_driver_sql(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, index_row[0])}")
 
         conn.exec_driver_sql(create_sql)
-        for statement in _sqlite_extra_column_ddl(quoted_table, extra) + index_sqls + extra_indexes:
+        for statement in index_sqls + extra_indexes:
             conn.exec_driver_sql(statement)
 
         conn.exec_driver_sql(
@@ -3078,9 +3063,8 @@ async def _migrate_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, 
             or not set(await _async_sqlite_index_columns(sess, row[0])) <= set(unique_columns)
         ]
 
-    carried, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
-    copied = carried + [col[1] for col in extra]
-    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in copied)
+    carried, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    copied_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
     # Rows written before ownership existed belong to the unowned bucket
     owner_sql = "COALESCE(user_id, '')" if "user_id" in [col[1] for col in table_info] else "''"
 
@@ -3090,7 +3074,7 @@ async def _migrate_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, 
         # Index names are unique across the database, so the old ones go first
         statements += [f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, row[0])}" for row in index_rows]
         statements.append(create_sql)
-        statements += _sqlite_extra_column_ddl(quoted_table, extra) + index_sqls + extra_indexes
+        statements += index_sqls + extra_indexes
         for statement in statements:
             await conn.exec_driver_sql(statement)
 
@@ -3668,7 +3652,7 @@ def _revert_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) -
         ).fetchall()
         kept_indexes = [row for row in index_rows if "user_id" not in _sqlite_index_columns(sess, row[0])]
 
-    _, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    _, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
     carried = [col[1] for col in table_info if col[1] != "user_id"]
     carried_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
 
@@ -3679,7 +3663,7 @@ def _revert_sqlite_metrics_table(db: BaseDb, table_type: str, table_name: str) -
             conn.exec_driver_sql(f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, index_row[0])}")
 
         conn.exec_driver_sql(legacy_ddl)
-        for statement in _sqlite_extra_column_ddl(quoted_table, extra) + legacy_index_sqls + extra_indexes:
+        for statement in legacy_index_sqls + extra_indexes:
             conn.exec_driver_sql(statement)
 
         conn.exec_driver_sql(f"INSERT INTO {quoted_table} ({carried_sql}) SELECT {carried_sql} FROM {quoted_backup}")
@@ -3724,7 +3708,7 @@ async def _revert_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, t
         index_rows = result.fetchall()
         kept_indexes = [row for row in index_rows if "user_id" not in await _async_sqlite_index_columns(sess, row[0])]
 
-    _, extra, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
+    _, extra_indexes = _sqlite_metrics_rebuild_plan(db, table_name, table_info, kept_indexes)
     carried = [col[1] for col in table_info if col[1] != "user_id"]
     carried_sql = ", ".join(quote_db_identifier(db_type, col) for col in carried)
 
@@ -3733,7 +3717,7 @@ async def _revert_async_sqlite_metrics_table(db: AsyncBaseDb, table_type: str, t
         statements = [f"ALTER TABLE {quoted_table} RENAME TO {quoted_backup}"]
         statements += [f"DROP INDEX IF EXISTS {quote_db_identifier(db_type, row[0])}" for row in index_rows]
         statements.append(legacy_ddl)
-        statements += _sqlite_extra_column_ddl(quoted_table, extra) + legacy_index_sqls + extra_indexes
+        statements += legacy_index_sqls + extra_indexes
         statements.append(f"INSERT INTO {quoted_table} ({carried_sql}) SELECT {carried_sql} FROM {quoted_backup}")
         statements.append(f"DROP TABLE {quoted_backup}")
         for statement in statements:

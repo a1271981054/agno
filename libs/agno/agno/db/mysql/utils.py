@@ -10,7 +10,7 @@ from agno.db.schemas.culture import CulturalKnowledge
 from agno.utils.log import log_debug, log_error, log_warning
 
 try:
-    from sqlalchemy import Engine, Table, and_, func, or_, select
+    from sqlalchemy import Engine, Table, and_, func, select
     from sqlalchemy.dialects import mysql
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
     from sqlalchemy.inspection import inspect
@@ -130,34 +130,6 @@ def is_valid_table(db_engine: Engine, table_name: str, table_type: str, db_schem
 
 
 # -- Metrics util methods --
-def _superseded_metrics_filter(table: Table, metrics_records: list[dict]):
-    """Build the filter matching the buckets the given records supersede.
-
-    An owner left holding a rewritten (date, aggregation_period) pair has no sessions on that
-    date anymore, and the unscoped /metrics aggregate would sum its stale row on top.
-
-    Args:
-        table (Table): The metrics table.
-        metrics_records (list[dict]): The freshly calculated metrics records.
-
-    Returns:
-        The filter clause, scoped to the pairs being written.
-    """
-    owners_per_pair: Dict[tuple, set] = {}
-    for record in metrics_records:
-        owners_per_pair.setdefault((record["date"], record["aggregation_period"]), set()).add(record["user_id"])
-
-    return or_(
-        *[
-            and_(
-                table.c.date == date_to_process,
-                table.c.aggregation_period == aggregation_period,
-                # NOT IN is three-valued: a NULL owner would evade it. Only hand-patched tables have one.
-                or_(table.c.user_id.is_(None), table.c.user_id.notin_(owners)),
-            )
-            for (date_to_process, aggregation_period), owners in owners_per_pair.items()
-        ]
-    )
 
 
 def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[dict]) -> list[dict]:
@@ -175,20 +147,6 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
         return []
 
     results = []
-
-    # Upsert in unique-key order: concurrent recalculations that lock the same rows in a
-    # different order deadlock on the unique index.
-    metrics_records = sorted(
-        metrics_records,
-        key=lambda record: (record["user_id"] or "", str(record["date"]), record["aggregation_period"]),
-    )
-
-    # Same transaction as the upserts below, so a crash can't leave a date with no metrics.
-    # Delete by primary key: a ranged DELETE next-key locks rows it spares and deadlocks against concurrent upserts.
-    stale_ids_stmt = select(table.c.id).where(_superseded_metrics_filter(table, metrics_records))
-    stale_ids = sorted(row[0] for row in session.execute(stale_ids_stmt))
-    if stale_ids:
-        session.execute(table.delete().where(table.c.id.in_(stale_ids)))
 
     # MySQL doesn't support returning in the same way as PostgreSQL
     # We'll need to insert/update and then fetch the records
@@ -238,20 +196,6 @@ async def abulk_upsert_metrics(session: AsyncSession, table: Table, metrics_reco
         return []
 
     results = []
-
-    # Upsert in unique-key order: concurrent recalculations that lock the same rows in a
-    # different order deadlock on the unique index.
-    metrics_records = sorted(
-        metrics_records,
-        key=lambda record: (record["user_id"] or "", str(record["date"]), record["aggregation_period"]),
-    )
-
-    # Same transaction as the upserts below, so a crash can't leave a date with no metrics.
-    # Delete by primary key: a ranged DELETE next-key locks rows it spares and deadlocks against concurrent upserts.
-    stale_ids_stmt = select(table.c.id).where(_superseded_metrics_filter(table, metrics_records))
-    stale_ids = sorted(row[0] for row in (await session.execute(stale_ids_stmt)))
-    if stale_ids:
-        await session.execute(table.delete().where(table.c.id.in_(stale_ids)))
 
     for record in metrics_records:
         stmt = mysql.insert(table).values(record)

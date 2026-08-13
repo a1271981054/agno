@@ -2111,35 +2111,21 @@ class MySQLDb(BaseDb):
 
             results = []
             metrics_records = []
-            dates_without_sessions = []
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # The sweep in ``bulk_upsert_metrics`` only reaches pairs it has records for, so clear these below
+                # Skip dates with no sessions
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
-                    dates_without_sessions.append(date_to_process)
                     continue
 
                 # One record per distinct user_id, plus an empty-string bucket for unowned sessions
                 metrics_records.extend(calculate_date_metrics(date_to_process, sessions_for_date))
 
-            if metrics_records or dates_without_sessions:
+            if metrics_records:
                 with self.Session() as sess, sess.begin():
-                    if metrics_records:
-                        results = bulk_upsert_metrics(session=sess, table=table, metrics_records=metrics_records)
-
-                    # A date churned to zero sessions still holds buckets from a previous pass. Delete by primary
-                    # key: a ranged DELETE next-key locks and deadlocks against concurrent upserts.
-                    if dates_without_sessions:
-                        stale_ids_stmt = select(table.c.id).where(
-                            table.c.date.in_(dates_without_sessions),
-                            table.c.aggregation_period == "daily",
-                        )
-                        stale_ids = sorted(row[0] for row in sess.execute(stale_ids_stmt))
-                        if stale_ids:
-                            sess.execute(table.delete().where(table.c.id.in_(stale_ids)))
+                    results = bulk_upsert_metrics(session=sess, table=table, metrics_records=metrics_records)
 
             return results
 

@@ -1893,15 +1893,13 @@ class FirestoreDb(BaseDb):
 
             results = []
             metrics_records = []
-            dates_without_sessions = []
 
             for date_to_process in dates_to_process:
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # The sweep in ``bulk_upsert_metrics`` only reaches dates it is given records for.
+                # Skip dates with no sessions
                 if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
-                    dates_without_sessions.append(date_key)
                     continue
 
                 # One record per distinct user_id, plus the empty-string bucket for unowned sessions.
@@ -1909,12 +1907,6 @@ class FirestoreDb(BaseDb):
 
             if metrics_records:
                 results = bulk_upsert_metrics(collection_ref, metrics_records)
-
-            # A date churned to zero sessions still holds documents from a previous pass.
-            for date_key in dates_without_sessions:
-                for doc in collection_ref.where(filter=FieldFilter("date", "==", date_key)).stream():
-                    if (doc.to_dict() or {}).get("aggregation_period") == "daily":
-                        doc.reference.delete()
 
             log_debug("Updated metrics calculations")
 

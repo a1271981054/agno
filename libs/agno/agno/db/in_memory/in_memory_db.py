@@ -17,12 +17,7 @@ from agno.db.schemas.culture import CulturalKnowledge
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
 from agno.db.schemas.memory import UserMemory
-from agno.db.utils import (
-    deserialize_session,
-    deserialize_sessions,
-    filter_context_runs,
-    is_superseded_metrics_record,
-)
+from agno.db.utils import deserialize_session, deserialize_sessions, filter_context_runs
 from agno.session import AgentSession, Session, TeamSession, WorkflowSession
 from agno.utils.log import log_debug, log_error, log_info, log_warning
 
@@ -893,17 +888,12 @@ class InMemoryDb(BaseDb):
                 date_key = date_to_process.isoformat()
                 sessions_for_date = all_sessions_data.get(date_key, {})
 
-                # One record per user_id. An empty date yields none — the sweep below clears its buckets.
-                date_records = calculate_date_metrics(date_to_process, sessions_for_date)
+                # Skip dates with no sessions
+                if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
+                    continue
 
-                owners = {record["user_id"] for record in date_records}
-                self._metrics = [
-                    existing_metric
-                    for existing_metric in self._metrics
-                    if not is_superseded_metrics_record(existing_metric, date_to_process, owners)
-                ]
-
-                for metrics_record in date_records:
+                # One metrics record per user_id: upsert each by (user_id, date, aggregation_period)
+                for metrics_record in calculate_date_metrics(date_to_process, sessions_for_date):
                     existing_record_idx = None
                     for i, existing_metric in enumerate(self._metrics):
                         if (

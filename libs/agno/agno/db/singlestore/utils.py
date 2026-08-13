@@ -154,30 +154,35 @@ def is_valid_table(db_engine: Engine, table_name: str, table_type: str, db_schem
 
 
 # -- Metrics util methods --
-def _superseded_metrics_delete(table: Table, metrics_records: list[dict]):
-    """Build the DELETE clearing the buckets the given records supersede.
+def _rewritten_metrics_delete(table: Table, metrics_records: list[dict]):
+    """Build the DELETE clearing the buckets these records replace.
 
-    Clears EVERY row for the pairs being rewritten, not just the superseded owners: SingleStore has no
-    unique key on metrics, so a repeated calculation can already have left several rows per bucket.
+    Scoped to the buckets being written, so a bucket the recalculation does not produce keeps its
+    row. Without a unique key to upsert against, a repeated calculation can leave several rows per
+    bucket, so every row for those keys goes and the fresh set is written in its place.
 
     Args:
         table (Table): The metrics table.
         metrics_records (list[dict]): The freshly calculated metrics records.
 
     Returns:
-        The DELETE statement, scoped to the pairs being written.
+        The DELETE statement, scoped to the buckets being written.
     """
-    return table.delete().where(_superseded_metrics_pairs(table, metrics_records))
+    return table.delete().where(_rewritten_metrics_keys(table, metrics_records))
 
 
-def _superseded_metrics_pairs(table: Table, metrics_records: list[dict]):
-    """Match every row for the (date, aggregation_period) pairs being written."""
-    pairs = {(record["date"], record["aggregation_period"]) for record in metrics_records}
+def _rewritten_metrics_keys(table: Table, metrics_records: list[dict]):
+    """Match every row for the (user_id, date, aggregation_period) keys being written."""
+    keys = {(record.get("user_id", ""), record["date"], record["aggregation_period"]) for record in metrics_records}
 
     return or_(
         *[
-            and_(table.c.date == date_to_process, table.c.aggregation_period == aggregation_period)
-            for date_to_process, aggregation_period in pairs
+            and_(
+                table.c.user_id == user_id,
+                table.c.date == date_to_process,
+                table.c.aggregation_period == aggregation_period,
+            )
+            for user_id, date_to_process, aggregation_period in keys
         ]
     )
 
@@ -185,12 +190,12 @@ def _superseded_metrics_pairs(table: Table, metrics_records: list[dict]):
 def _existing_metrics_identity(session: Session, table: Table, metrics_records: list[dict]) -> Dict[tuple, tuple]:
     """Each bucket's current id and created_at, keyed by (user_id, date, period).
 
-    The delete clears whole pairs, so without this a bucket would take a new id and created_at on
+    The delete clears whole buckets, so without this a bucket would take a new id and created_at on
     every refresh. A bucket can hold several rows, so the earliest created_at wins and its id with it.
     """
     rows = session.execute(
         select(table.c.user_id, table.c.date, table.c.aggregation_period, table.c.id, table.c.created_at).where(
-            _superseded_metrics_pairs(table, metrics_records)
+            _rewritten_metrics_keys(table, metrics_records)
         )
     ).fetchall()
 
@@ -222,7 +227,7 @@ def bulk_upsert_metrics(session: Session, table: Table, metrics_records: list[di
     carried = _existing_metrics_identity(session, table, metrics_records)
 
     # Committed together with the writes below, so a crash can't leave a date with no metrics.
-    session.execute(_superseded_metrics_delete(table, metrics_records))
+    session.execute(_rewritten_metrics_delete(table, metrics_records))
 
     results = []
     for record in metrics_records:

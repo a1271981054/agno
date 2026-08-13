@@ -234,37 +234,6 @@ def get_dates_to_calculate_metrics_for(starting_date: date) -> list[date]:
     return [starting_date + timedelta(days=x) for x in range(days_diff)]
 
 
-def _superseded_metrics_filter(metrics_records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build the filter matching the buckets the given records supersede.
-
-    An owner left over on a pair this recalculation wrote has no sessions on that date, and its stale
-    document would be summed on top of the fresh ones. ``$nin`` also matches the pre-user_id document,
-    which carries no ``user_id`` field at all.
-
-    Args:
-        metrics_records (List[Dict[str, Any]]): The freshly calculated metrics records.
-
-    Returns:
-        The delete filter, scoped to the pairs being written.
-    """
-    owners_per_pair: Dict[tuple, set] = {}
-    for record in metrics_records:
-        record_date = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
-        owners_per_pair.setdefault((record_date, record["aggregation_period"]), set()).add(record.get("user_id", ""))
-
-    # ``key=str``: nothing coerces user_id, and a mixed-type owner set would make a bare sort raise
-    return {
-        "$or": [
-            {
-                "date": record_date,
-                "aggregation_period": aggregation_period,
-                "user_id": {"$nin": sorted(owners, key=str)},
-            }
-            for (record_date, aggregation_period), owners in owners_per_pair.items()
-        ]
-    }
-
-
 def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Bulk upsert metrics into the database.
 
@@ -301,10 +270,6 @@ def bulk_upsert_metrics(collection: Collection, metrics_records: List[Dict[str, 
         except Exception as e:
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
-
-    # Clear what this recalculation supersedes. Without a transaction this runs after the fresh set is in
-    # place, so a crash leaves a stale bucket over the day's total rather than a date with no metrics.
-    collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results
 
@@ -347,10 +312,6 @@ async def abulk_upsert_metrics(
         except Exception as e:
             log_error(f"Error upserting metrics record: {str(e)}")
             continue
-
-    # Clear what this recalculation supersedes. Without a transaction this runs after the fresh set is in
-    # place, so a crash leaves a stale bucket over the day's total rather than a date with no metrics.
-    await collection.delete_many(_superseded_metrics_filter(metrics_records))
 
     return results
 

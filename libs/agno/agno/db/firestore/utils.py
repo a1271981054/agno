@@ -12,7 +12,7 @@ from agno.db.utils import get_sort_value
 from agno.utils.log import log_debug, log_error, log_info, log_warning
 
 try:
-    from google.cloud.firestore import Client, FieldFilter  # type: ignore[import-untyped]
+    from google.cloud.firestore import Client  # type: ignore[import-untyped]
     from google.cloud.firestore_admin_v1 import FirestoreAdminClient, Index  # type: ignore[import-untyped]
 except ImportError:
     raise ImportError(
@@ -328,35 +328,6 @@ def get_dates_to_calculate_metrics_for(starting_date: date) -> list[date]:
     return [starting_date + timedelta(days=x) for x in range(days_diff)]
 
 
-def _superseded_metrics_docs(collection_ref, metrics_records: List[Dict[str, Any]]) -> List[Any]:
-    """Return the document references for the buckets the given records supersede.
-
-    An owner left over on a pair this recalculation wrote has no sessions on that date, and its stale
-    document would be summed on top of the fresh ones, the pre-user_id ``{date}_daily`` doc included.
-
-    Args:
-        collection_ref: The Firestore metrics collection reference.
-        metrics_records (List[Dict[str, Any]]): The freshly calculated metrics records.
-
-    Returns:
-        The document references to delete.
-    """
-    owners_per_pair: Dict[tuple, set] = {}
-    for record in metrics_records:
-        record_date = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]
-        owners_per_pair.setdefault((record_date, record["aggregation_period"]), set()).add(record.get("user_id", ""))
-
-    doc_refs = []
-    for (record_date, aggregation_period), owners in owners_per_pair.items():
-        # ``date`` alone uses a single-field index; ``not-in`` caps at 10 values and skips docs with no ``user_id``.
-        for doc in collection_ref.where(filter=FieldFilter("date", "==", record_date)).stream():
-            data = doc.to_dict() or {}
-            if data.get("aggregation_period") == aggregation_period and data.get("user_id") not in owners:
-                doc_refs.append(doc.reference)
-
-    return doc_refs
-
-
 def bulk_upsert_metrics(collection_ref, metrics_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Bulk upsert metrics into the database.
 
@@ -373,17 +344,7 @@ def bulk_upsert_metrics(collection_ref, metrics_records: List[Dict[str, Any]]) -
     results = []
     batch = collection_ref._client.batch()
 
-    # Clear what this recalculation supersedes in the same batch as the writes, so a failed commit can't
-    # leave a date with no metrics. Across a chunk boundary it can: Firestore has no wider unit of atomicity.
     staged = 0
-    for doc_ref in _superseded_metrics_docs(collection_ref, metrics_records):
-        batch.delete(doc_ref)
-        staged += 1
-
-        # Firestore caps a commit at 10 MiB, not an operation count; 500 is the proxy the old limit used.
-        if staged % 500 == 0:
-            batch.commit()
-            batch = collection_ref._client.batch()
 
     for record in metrics_records:
         record["date"] = record["date"].isoformat() if isinstance(record["date"], date) else record["date"]

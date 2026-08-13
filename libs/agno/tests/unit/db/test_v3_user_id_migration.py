@@ -771,25 +771,21 @@ def test_metrics_migration_is_idempotent():
     assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
 
 
-def test_metrics_rebuild_carries_operator_columns_and_indexes():
-    """The rebuild replaces the table, so it has to carry over what the schema does not know about."""
+def test_metrics_rebuild_refuses_a_table_with_operator_columns():
+    """The rebuild recreates the table from the schema, so a column it does not declare would go
+    with it. The table is left alone instead."""
     db, db_file = _new_legacy_metrics_db()
     _run_sqlite(
         db_file,
         f"ALTER TABLE {METRICS_TABLE} ADD COLUMN cost_centre TEXT",
-        f"CREATE INDEX idx_metrics_cost_centre ON {METRICS_TABLE} (cost_centre)",
         f"UPDATE {METRICS_TABLE} SET cost_centre = 'eu-west'",
     )
+    before_ddl = _table_ddl(db_file, METRICS_TABLE)
 
     asyncio.run(MigrationManager(db).up(table_type="metrics"))
 
-    assert "cost_centre" in _table_columns(db_file, METRICS_TABLE)
-    assert "idx_metrics_cost_centre" in _table_indexes(db_file, METRICS_TABLE)
-
-    asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="metrics"))
-
-    assert "cost_centre" in _table_columns(db_file, METRICS_TABLE)
-    assert "idx_metrics_cost_centre" in _table_indexes(db_file, METRICS_TABLE)
+    assert _table_ddl(db_file, METRICS_TABLE) == before_ddl
+    assert "user_id" not in _table_columns(db_file, METRICS_TABLE)
     conn = sqlite3.connect(db_file)
     try:
         assert conn.execute(f"SELECT cost_centre FROM {METRICS_TABLE}").fetchall() == [("eu-west",)]
