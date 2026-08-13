@@ -53,7 +53,6 @@ agent = Agent(
     model=OpenAIChat(id="gpt-4o-mini"),
     tools=[YFinanceTools(enable_stock_price=True, enable_company_info=True)],
     reasoning_model=OpenAIChat(id="gpt-4o-mini"),
-    reasoning=True,
     compression_manager=CompressionManager(
         model=OpenAIChat(id="gpt-4o-mini"),
         compress_tool_results_limit=1,

@@ -35,7 +35,6 @@ def run_examples() -> None:
 
     agent = Agent(
         model=OpenAIChat(id="gpt-4o"),
-        reasoning=True,
         markdown=True,
     )
 
@@ -61,7 +60,6 @@ def run_examples() -> None:
 
     streaming_agent = Agent(
         model=OpenAIChat(id="gpt-4o"),
-        reasoning=True,
         markdown=True,
     )
 
