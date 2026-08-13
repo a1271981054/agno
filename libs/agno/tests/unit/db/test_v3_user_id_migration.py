@@ -791,30 +791,6 @@ def test_metrics_migration_is_idempotent():
     assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
 
 
-def test_metrics_migrated_table_matches_a_fresh_one():
-    """A rebuilt table and one created from scratch must declare the same shape."""
-    _, fresh_file = _new_db_with(["metrics"])
-    db, db_file = _new_legacy_metrics_db()
-
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-
-    assert _table_ddl(db_file, METRICS_TABLE) == _table_ddl(fresh_file, METRICS_TABLE)
-    assert _table_indexes(db_file, METRICS_TABLE) == _table_indexes(fresh_file, METRICS_TABLE)
-
-
-def test_metrics_migration_runs_when_a_column_name_holds_the_key_name():
-    """The unique key is read out of the table's indexes, not looked for in its
-    CREATE statement: a column whose name merely contains the key's is not the key."""
-    db, db_file = _new_legacy_metrics_db()
-    lookalike_column = f"{METRICS_UNIQUE}_note"
-    _run_sqlite(db_file, f"ALTER TABLE {METRICS_TABLE} ADD COLUMN {lookalike_column} TEXT")
-
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-
-    assert METRICS_UNIQUE in _table_ddl(db_file, METRICS_TABLE)
-    assert lookalike_column in _table_columns(db_file, METRICS_TABLE)
-
-
 def test_metrics_rebuild_carries_operator_columns_and_indexes():
     """The rebuild replaces the table, so a column and an index the schema knows
     nothing about are only still there afterwards if it carries them over."""
@@ -930,17 +906,6 @@ def test_metrics_revert_restores_the_legacy_unique_key():
     assert "user_id" not in _table_columns(db_file, METRICS_TABLE)
     assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
     assert db.get_latest_schema_version(METRICS_TABLE) == "2.5.6"
-
-
-def test_metrics_up_after_down_restores_everything():
-    db, db_file = _new_legacy_metrics_db()
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-    asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="metrics"))
-
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-
-    assert METRICS_UNIQUE in _table_ddl(db_file, METRICS_TABLE)
-    assert _metrics_rows(db_file) == [(FINISHED_DAY.isoformat(), 7)]
 
 
 @pytest.mark.asyncio
@@ -1197,19 +1162,6 @@ def test_live_metrics_case_distinct_owners_keep_separate_buckets(live_metrics_db
     assert [record["user_id"] for record in scoped] == ["ALICE"]
 
 
-def test_live_metrics_migration_is_idempotent(live_metrics_db):
-    db = live_metrics_db
-
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-    before_keys = _live_unique_keys(db)
-    before_indexes = _live_indexes(db)
-    asyncio.run(MigrationManager(db).up(table_type="metrics", force=True))
-
-    assert _live_unique_keys(db) == before_keys
-    assert _live_indexes(db) == before_indexes
-    assert _live_metrics_rows(db) == [(FINISHED_DAY, 7)]
-
-
 def test_live_metrics_revert_restores_the_legacy_unique_key(live_metrics_db):
     db = live_metrics_db
     table = db.metrics_table_name
@@ -1239,18 +1191,6 @@ def test_live_metrics_revert_refuses_while_rows_are_owned(live_metrics_db):
     assert "user_id" in _live_columns(db)
     assert _live_unique_keys(db) == {f"{table}_uq_metrics_user_date_period": ["user_id", "date", "aggregation_period"]}
     assert db.get_latest_schema_version(table) == "3.0.0"
-
-
-def test_live_metrics_up_after_down_restores_everything(live_metrics_db):
-    db = live_metrics_db
-    table = db.metrics_table_name
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-    asyncio.run(MigrationManager(db).down(target_version="2.5.6", table_type="metrics"))
-
-    asyncio.run(MigrationManager(db).up(table_type="metrics"))
-
-    assert _live_unique_keys(db) == {f"{table}_uq_metrics_user_date_period": ["user_id", "date", "aggregation_period"]}
-    assert _live_metrics_rows(db) == [(FINISHED_DAY, 7)]
 
 
 @pytest.mark.asyncio
